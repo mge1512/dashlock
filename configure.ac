@@ -89,7 +89,7 @@ AC_CHECK_DECL([PRIdMAX],,
 ])
 
 dnl Checks for library functions.
-AC_CHECK_FUNCS(bsearch faccessat getpwnam getrlimit isalpha killpg \
+AC_CHECK_FUNCS(bsearch faccessat getpwnam getpwuid_r getrlimit isalpha killpg \
 	       memfd_create memrchr mempcpy \
 	       sigsetmask stpcpy strchrnul strsignal strtod strtoimax \
 	       strtoumax sysconf tee wait3)
@@ -228,5 +228,99 @@ AC_ARG_ENABLE(lineno, AS_HELP_STRING(--disable-lineno, \
 if test "$enable_lineno" != "no"; then
 	AC_DEFINE([WITH_LINENO], 1, [Define if you build with -DWITH_LINENO])
 fi
-AC_CONFIG_FILES([Makefile src/Makefile])
+
+dnl ---------------------------------------------------------------------
+dnl dashlock: Landlock self-confinement.
+dnl
+dnl Off unless linux/landlock.h is present.  --enable-dashlock makes a
+dnl missing header a hard error instead of a silent downgrade, so that a
+dnl build expected to produce a confining shell cannot quietly produce a
+dnl plain one.
+dnl ---------------------------------------------------------------------
+
+AC_ARG_ENABLE(dashlock,
+	AS_HELP_STRING(--disable-dashlock,
+		       [Do not build Landlock self-confinement support]),,
+	[enable_dashlock=auto])
+
+AC_ARG_ENABLE(dashlock-name-gate,
+	AS_HELP_STRING(--disable-dashlock-name-gate,
+		       [Confine regardless of the name the binary is invoked as]),,
+	[enable_dashlock_name_gate=yes])
+
+AC_ARG_WITH(dashlock-name,
+	AS_HELP_STRING(--with-dashlock-name=NAME,
+		       [Invocation name that triggers confinement (default: dashlock)]),,
+	[with_dashlock_name=dashlock])
+
+AC_ARG_WITH(dashlock-etcdir,
+	AS_HELP_STRING(--with-dashlock-etcdir=DIR,
+		       [Administrator policy directory (default: /etc/dashlock)]),,
+	[with_dashlock_etcdir=/etc/dashlock])
+
+AC_ARG_WITH(dashlock-libdir,
+	AS_HELP_STRING(--with-dashlock-libdir=DIR,
+		       [Vendor policy directory (default: /usr/lib/dashlock)]),,
+	[with_dashlock_libdir=/usr/lib/dashlock])
+
+use_dashlock=no
+if test "$enable_dashlock" != "no"; then
+	AC_CHECK_HEADERS([linux/landlock.h],
+			 [have_landlock_h=yes], [have_landlock_h=no])
+	if test "$have_landlock_h" = "yes"; then
+		use_dashlock=yes
+	elif test "$enable_dashlock" = "yes"; then
+		AC_MSG_ERROR([--enable-dashlock requires linux/landlock.h])
+	fi
+fi
+
+dnl dashlock selects its policy by the account name of the real user ID.
+dnl Without getpwuid_r that selection would silently fall back to the
+dnl numeric ID for every account, which is a different policy decision than
+dnl the administrator wrote.  Refuse to enable the feature rather than build
+dnl a shell that quietly keys every session by number.
+if test "$use_dashlock" = "yes" && test "$ac_cv_func_getpwuid_r" != "yes"; then
+	if test "$enable_dashlock" = "yes"; then
+		AC_MSG_ERROR([dashlock requires getpwuid_r])
+	fi
+	AC_MSG_WARN([getpwuid_r not found; dashlock support disabled])
+	use_dashlock=no
+fi
+
+AC_MSG_CHECKING([whether to build dashlock support])
+AC_MSG_RESULT($use_dashlock)
+
+if test "$use_dashlock" = "yes"; then
+	case "$with_dashlock_etcdir" in
+	  /*) ;;
+	  *) AC_MSG_ERROR([--with-dashlock-etcdir must be an absolute path]) ;;
+	esac
+	case "$with_dashlock_libdir" in
+	  /*) ;;
+	  *) AC_MSG_ERROR([--with-dashlock-libdir must be an absolute path]) ;;
+	esac
+	dnl Strip a trailing slash so that joining with "/users/name" cannot
+	dnl produce an empty path component that the runtime verifier refuses.
+	dnl "/" itself is never a valid policy directory, so this is safe.
+	with_dashlock_etcdir=`printf %s "$with_dashlock_etcdir" | sed 's,/*$,,'`
+	with_dashlock_libdir=`printf %s "$with_dashlock_libdir" | sed 's,/*$,,'`
+	AC_DEFINE([USE_DASHLOCK], 1,
+		  [Define to build Landlock self-confinement support])
+	AC_DEFINE_UNQUOTED([DASHLOCK_NAME], ["$with_dashlock_name"],
+			   [Invocation name that triggers confinement])
+	AC_DEFINE_UNQUOTED([DASHLOCK_ETCDIR], ["$with_dashlock_etcdir"],
+			   [Administrator policy directory])
+	AC_DEFINE_UNQUOTED([DASHLOCK_LIBDIR], ["$with_dashlock_libdir"],
+			   [Vendor policy directory])
+	if test "$enable_dashlock_name_gate" != "no"; then
+		AC_DEFINE([DASHLOCK_NAME_GATE], 1,
+			  [Define to confine only when invoked under DASHLOCK_NAME])
+	fi
+fi
+
+AM_CONDITIONAL([BUILD_DASHLOCK], [test "$use_dashlock" = "yes"])
+AC_SUBST([DASHLOCK_ETCDIR], [$with_dashlock_etcdir])
+AC_SUBST([DASHLOCK_LIBDIR], [$with_dashlock_libdir])
+
+AC_CONFIG_FILES([Makefile src/Makefile policy/Makefile])
 AC_OUTPUT

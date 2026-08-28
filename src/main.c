@@ -59,6 +59,7 @@
 #include "mystring.h"
 #include "exec.h"
 #include "cd.h"
+#include "dashlock.h"
 
 #define PROFILE 0
 
@@ -94,6 +95,15 @@ main(int argc, char **argv)
 	volatile int state;
 	struct stackmark smark;
 	int login;
+
+	/*
+	 * Landlock self-confinement.  Must be the first statement: it has to
+	 * run before init(), before procargs(), and therefore before any
+	 * profile file, rc file or -c argument is read or parsed.  Returns
+	 * without side effects unless the binary was invoked under the
+	 * configured trigger name.
+	 */
+	dashlock_init(&argc, argv);
 
 #ifdef __GLIBC__
 	dash_errno = __errno_location();

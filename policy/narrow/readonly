@@ -1,0 +1,36 @@
+# /usr/lib/dashlock/narrow/readonly
+#
+# Example narrowing layer.  Applied with:
+#
+#   dashlock --narrow readonly -c '...'
+#
+# A narrowing layer can only remove access, never add it, because the kernel
+# intersects layers.  Everything the user policy denied stays denied, so this
+# file can be selected by a caller that is not otherwise trusted.
+#
+# Because layers intersect, a narrowing layer must repeat every path it wants
+# to keep.  A path this file does not mention becomes inaccessible for the
+# invocation, including the working directory.  Add the paths the invocation
+# needs before using it for real work.
+#
+# This layer leaves /tmp writable and removes write access everywhere else.
+
+abi-min 6
+
+# Cap the kernel ABI this policy is trusted against.  "access fs" below
+# handles every right this build knows; on a newer kernel that adds a right,
+# that right would be left unhandled and so unrestricted.  Raise this only
+# after reviewing the newer ABI's rights against the rules below.
+abi-max 6
+
+access fs
+
+rule path-beneath:execute,read-file,read-dir:/usr
+rule path-beneath:read-file,read-dir:/etc
+rule path-beneath:read-file,read-dir:/proc
+rule path-beneath:read-file,write-file,ioctl-dev:/dev/tty
+rule path-beneath:read-file,write-file,ioctl-dev:/dev/pts
+rule path-beneath:read-file,write-file:/dev/null
+rule path-beneath:read-file:/dev/urandom
+rule path-beneath:read-file:/dev/zero
+rule path-beneath:read-file,write-file,read-dir,make-reg,make-dir,remove-file,remove-dir,refer,truncate:/tmp
