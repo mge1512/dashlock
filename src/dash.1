@@ -2338,6 +2338,14 @@ Otherwise
 the shell will return the exit status of the last command executed, or
 if the exit builtin is used with a numeric argument, it will return the
 argument.
+.Pp
+When the shell is invoked as
+.Nm dashlock
+and the session cannot be confined as specified, the shell exits with status
+78 without executing anything.
+See
+.Sx DASHLOCK
+below.
 .Sh ENVIRONMENT
 .Bl -tag -width MAILCHECK
 .It Ev HOME
@@ -2421,7 +2429,322 @@ The process ID of the parent process of the shell.
 .Pa $HOME/.profile
 .It
 .Pa /etc/profile
+.It
+.Pa /etc/dashlock/users/ Ns Ar name
+.It
+.Pa /usr/lib/dashlock/users/ Ns Ar name
+.It
+.Pa /etc/dashlock/users/default
+.It
+.Pa /usr/lib/dashlock/users/default
+.It
+.Pa /etc/dashlock/narrow/ Ns Ar name
+.It
+.Pa /usr/lib/dashlock/narrow/ Ns Ar name
 .El
+.Sh DASHLOCK
+When this shell is built with Landlock support and is invoked under the name
+.Nm dashlock ,
+it applies a Landlock policy to itself before it reads
+.Pa /etc/profile ,
+.Pa $HOME/.profile ,
+the file named by
+.Ev ENV ,
+or any
+.Fl c
+argument.
+The restriction is inherited by every process the session starts and cannot be
+removed afterwards by any privilege level, including by the superuser.
+.Pp
+Invoked under any other name, including
+.Nm dash ,
+.Nm ash
+and
+.Nm sh ,
+the shell does none of this: no policy file is opened and no system call is
+made.
+The decision is taken on
+.Va argv Ns Bq 0
+alone.
+No environment variable and no command line option can turn the confinement on
+for a binary invoked under another name, or off for a binary invoked under the
+trigger name.
+A build configured with
+.Fl \-disable\-dashlock\-name\-gate
+confines whatever name it is invoked under.
+.Ss Policy lookup
+The policy is selected by the real user ID of the process, resolved to an
+account name.
+When no password database entry exists, the decimal user ID is used instead.
+The first of the following files that exists is used:
+.Bl -enum -compact -offset indent
+.It
+.Pa /etc/dashlock/users/ Ns Ar name
+.It
+.Pa /usr/lib/dashlock/users/ Ns Ar name
+.It
+.Pa /etc/dashlock/users/default
+.It
+.Pa /usr/lib/dashlock/users/default
+.El
+.Pp
+Administrator files under
+.Pa /etc
+mask vendor files under
+.Pa /usr/lib
+per file name.
+If none of the four exists, the shell refuses to start.
+.Pp
+A file that exists but fails validation stops the search; a lower-priority file
+is never used in its place.
+A policy file must be a regular file owned by the superuser and not writable by
+group or other, and every directory above it up to the root must satisfy the
+same conditions.
+No component of the path, from the root through the file itself, may be a
+symbolic link; a symbolic link anywhere in the chain is refused even when its
+target would pass.
+.Pp
+A symbolic link to
+.Pa /dev/null
+does
+.Em not
+mean "disabled" here, unlike the convention used elsewhere for configuration
+directories.
+It fails validation like any other non-regular file and the session is refused.
+.Ss Policy format
+One directive per line.
+A
+.Ql #
+starts a comment.
+There are no includes, no globbing, no variable substitution and no
+continuation lines.
+An unknown directive, rule type, access name or scope name is a refusal, never
+a skipped line.
+.Bl -tag -width "rule net-port:ACCESS:PORT"
+.It Cm abi-min Ar n
+Refuse unless the running kernel provides Landlock ABI version
+.Ar n
+or higher.
+This raises the requirement; it cannot lower it.
+The version a policy needs is derived from the directives it uses, so a policy
+is never applied with parts of it silently dropped.
+.It Cm abi-max Ar n
+Refuse if the running kernel provides a Landlock ABI version higher than
+.Ar n .
+A wildcard category such as
+.Cm access Cm fs
+handles every right this build knows about; on a future kernel that adds a
+right, that right would be left unhandled and so unrestricted.
+An author who uses a wildcard can set
+.Cm abi-max
+to the newest ABI they have reviewed, so that a newer kernel is refused rather
+than silently under-restricting.
+With several
+.Cm abi-max
+lines the lowest wins, and
+.Cm abi-max
+below
+.Cm abi-min
+is refused as a contradiction.
+.It Cm access Cm fs
+Handle every filesystem access right the running kernel supports.
+Anything not granted by a rule is then denied.
+.It Cm access Cm fs : Ns Ar list
+Handle only the named filesystem access rights.
+.It Cm access Cm net-tcp
+Handle both TCP access rights.
+.It Cm access Cm net-tcp : Ns Ar list
+Handle only the named TCP access rights.
+.It Cm rule Cm path-beneath : Ns Ar list : Ns Ar path
+Allow the named access rights beneath
+.Ar path ,
+which must be absolute.
+Only the first two colons are separators, so a path may itself contain colons.
+No component of
+.Ar path
+may be a symbolic link.
+A Landlock rule binds to the resolved object, not to the text of the path, so
+if the confined account can rename or replace a directory in
+.Ar path ,
+it can change which object the rule grants.
+Rule paths should therefore name locations whose parent directories the
+confined account cannot write.
+.It Cm rule Cm net-port : Ns Ar list : Ns Ar port
+Allow the named TCP access rights on
+.Ar port .
+Port 0 is permitted only for a
+.Cm bind-tcp
+rule, where it means an ephemeral port; it is refused for
+.Cm connect-tcp .
+.It Cm scope Ar list
+Restrict the named IPC channels to the domain.
+Requires ABI version 6.
+.El
+.Pp
+The access right names are those used by
+.Xr setpriv 1 :
+.Cm execute , write-file , read-file , read-dir , remove-dir , remove-file ,
+.Cm make-char , make-dir , make-reg , make-sock , make-fifo , make-block ,
+.Cm make-sym , refer , truncate
+and
+.Cm ioctl-dev .
+The TCP names are
+.Cm bind-tcp
+and
+.Cm connect-tcp .
+The scope names are
+.Cm abstract-unix-socket
+and
+.Cm signal .
+.Ss Narrowing a single invocation
+.Bd -literal -offset indent
+dashlock \-\-narrow Ar name Fl c Ar command
+.Ed
+.Pp
+applies a second policy layer on top of the user policy.
+.Ar name
+must consist of characters from
+.Bq A\-Za\-z0\-9_\-
+only, and is looked up in
+.Pa /etc/dashlock/narrow/
+and then
+.Pa /usr/lib/dashlock/narrow/ .
+There is no default; a missing narrowing policy is a refusal.
+.Pp
+The pair is recognized in the first argument position only.
+Anywhere else,
+.Fl \-narrow
+is an ordinary shell argument and is passed through unchanged.
+.Pp
+The kernel intersects layers, so a narrowing policy can only remove access,
+never add it.
+Whoever builds the command line can therefore be allowed to influence the
+policy without being trusted.
+Because layers intersect, a narrowing policy must repeat every path it wants to
+keep: a path it does not mention becomes inaccessible.
+.Ss Consequences to expect
+Landlock requires
+.Dv no_new_privs ,
+so
+.Xr sudo 8 ,
+.Xr su 1 ,
+.Xr pkexec 1
+and file-capability binaries stop conferring privilege for the session.
+.Pp
+Every dynamically linked program the session runs needs the loader and the
+libraries, so a policy must grant read and execute on the library tree and read
+on
+.Pa /etc/ld.so.cache .
+Under a merged
+.Pa /usr
+a rule on
+.Pa /usr
+covers the loader, because Landlock resolves the symbolic link and matches on
+the inode.
+.Pp
+Landlock has no hooks for
+.Xr mount 2 ,
+.Xr chdir 2
+or metadata operations such as
+.Xr chmod 2 ,
+.Xr chown 2
+and
+.Xr setxattr 2 ,
+and on the network side it covers TCP only.
+UDP, ICMP and raw sockets are outside its scope.
+.Pp
+The requirement that a policy file be owned by the superuser is evaluated in
+the caller's user namespace.
+Where unprivileged user namespaces are enabled, a user can become
+namespace-root and present a policy that passes the ownership check.
+For an account whose confinement is the point, disable unprivileged user
+namespaces, or have a trusted launcher establish the namespace before
+.Xr execve 2 ,
+and use a build configured with
+.Fl \-disable\-dashlock\-name\-gate .
+.Pp
+Abstract-socket scoping closes one path from a confined process to an
+unconfined broker, but not all of them.
+A broker reachable through a filesystem-named UNIX socket on an allowed path,
+an already-connected socket inherited from before confinement, or a descriptor
+received over
+.Xr unix 7
+.Cm SCM_RIGHTS
+is outside that scope, and an allowed TCP port reaches whatever listens on it.
+Treat every unconfined process running as the same user, and every descriptor
+the session starts with, as part of the attack surface, and close those paths
+by other means where they matter.
+.Pp
+Every Landlock ruleset denies cross-hierarchy
+.Cm refer
+(link and rename between directories) whether or not the policy handles it.
+A network-only or scope-only narrowing layer therefore still changes link and
+rename behaviour.
+A policy that needs cross-hierarchy rename must list
+.Cm refer
+explicitly.
+.Pp
+Confinement applies to the shell.
+Paths that reach the account without starting a shell, such as the SFTP
+subsystem of
+.Xr sshd 8 ,
+the per-user service manager, and
+.Xr cron 8 ,
+are not affected and must be closed separately.
+.Pp
+Landlock gained audit records at ABI version 7.
+Below that, a denial is diagnosed as
+.Er EACCES
+with no record of which rule refused it.
+.Ss Security considerations
+Confinement begins inside the program, in
+.Fn main .
+The dynamic loader and any constructors it runs execute before that, so a
+process that controls the environment of the first
+.Xr execve 2
+can run code before the policy is applied, through
+.Ev LD_PRELOAD
+or
+.Ev LD_AUDIT .
+The confinement is therefore only as strong as the launcher: the environment of
+the first exec must not be under the control of the confined account.
+The standard login paths provide this.
+.Xr sshd 8
+rejects user-supplied environment variables unless
+.Cm PermitUserEnvironment
+is enabled, which it is not by default, and
+.Xr login 1
+sanitizes the environment it passes.
+A custom launcher must give the same guarantee.
+Once the policy is applied, the domain survives every later
+.Xr execve 2
+and cannot be influenced from inside.
+.Pp
+A set-user-ID or set-group-ID invocation is refused before any policy file is
+read.
+The policy is selected by the real user ID, so a set-ID invocation would
+confine one identity while holding the power of another.
+.Pp
+The name gate trusts the launcher to pass a truthful
+.Va argv Ns Bq 0 .
+The launchers on a stock system do, but the property rests on that convention.
+Where confinement of an account is the point rather than a convenience, use a
+build configured with
+.Fl \-disable\-dashlock\-name\-gate ,
+which removes the dependency on
+.Va argv Ns Bq 0
+entirely: that build applies a policy whatever it is invoked as, and refuses to
+run without one.
+.Pp
+An account whose name contains bytes outside the printable ASCII range, or a
+.Ql / ,
+or whose name does not fit in 255 bytes, is keyed by its decimal user ID
+instead of its name.
+A failing name service lookup, by contrast, refuses the session rather than
+falling back, so an outage cannot select a different policy file.
+.Pp
+Diagnostics for failed system calls append the error number in the form
+.Ql (errno N) .
 .Sh SEE ALSO
 .Xr csh 1 ,
 .Xr echo 1 ,
@@ -2434,6 +2757,8 @@ The process ID of the parent process of the shell.
 .Xr passwd 5 ,
 .\" .Xr profile 4 ,
 .Xr environ 7 ,
+.Xr landlock 7 ,
+.Xr setpriv 1 ,
 .Xr sysctl 8
 .Sh HISTORY
 .Nm

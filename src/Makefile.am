@@ -21,9 +21,19 @@ dash_CFILES = \
 	histedit.c input.c jobs.c mail.c main.c memalloc.c miscbltin.c \
 	mystring.c options.c parser.c redir.c show.c trap.c output.c \
 	bltin/printf.c system.c bltin/test.c bltin/times.c var.c
+
+# dashlock.c is deliberately kept out of dash_CFILES: that variable is the
+# input to mkinit, and the Landlock code must take no part in the shell's
+# init machinery.  It is also the only source file that must not include a
+# shell header, because main.h redefines errno as (*dash_errno) and
+# dash_errno is only assigned inside main().
+dashlock_CFILES = dashlock.c
+
 dash_SOURCES = \
 	$(dash_CFILES) \
-	alias.h arith_yacc.h bltin/bltin.h cd.h error.h eval.h exec.h \
+	$(dashlock_CFILES) \
+	alias.h arith_yacc.h bltin/bltin.h cd.h dashlock.h error.h eval.h \
+	exec.h \
 	expand.h \
 	init.h input.h jobs.h machdep.h mail.h main.h memalloc.h miscbltin.h \
 	myhistedit.h mystring.h options.h output.h parser.h redir.h shell.h \

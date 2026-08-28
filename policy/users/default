@@ -1,0 +1,70 @@
+# /usr/lib/dashlock/users/default
+#
+# Vendor default policy.  It applies to any account that has no file of its
+# own under /etc/dashlock/users/ or /usr/lib/dashlock/users/.
+#
+# It is a filesystem allowlist for the operations Landlock mediates.  Within
+# that scope it grants no access to any home directory: a session can start
+# programs and use /tmp, which is enough to log in and diagnose the setup and
+# not enough to do work.  Write a policy for the account in
+# /etc/dashlock/users/<name>.
+#
+# Outside that scope this policy restricts nothing.  It sets no network
+# handling, so TCP is unrestricted; Landlock cannot restrict UDP, ICMP or raw
+# sockets at all; metadata operations such as chmod, chown and rename
+# timestamps are not mediated; and any descriptor the session inherited from
+# before startup remains usable regardless of the rules below.  See the
+# DASHLOCK section of dash(1).
+#
+# Access right names are the ones setpriv(1) uses, so any line below can be
+# tried on the command line before it is installed:
+#
+#   setpriv --landlock-access fs \
+#           --landlock-rule path-beneath:execute,read-file,read-dir:/usr ... -- sh
+
+abi-min 6
+
+# Cap the kernel ABI this policy is trusted against.  "access fs" below
+# handles every right this build knows; on a newer kernel that adds a right,
+# that right would be left unhandled and so unrestricted.  Raise this only
+# after reviewing the newer ABI's rights against the rules below.
+abi-max 6
+
+# Handle every filesystem right the running kernel supports.  Anything not
+# granted below is therefore denied.
+access fs
+
+# Programs, libraries and the dynamic loader.  Under a merged /usr this rule
+# also covers /lib64/ld-linux-*.so, because Landlock resolves the symbolic
+# link and matches on the inode.
+rule path-beneath:execute,read-file,read-dir:/usr
+
+# Configuration, including /etc/ld.so.cache.  Without that file the loader
+# falls back to searching the library directories.
+rule path-beneath:read-file,read-dir:/etc
+
+# Process introspection used by ordinary tools.
+rule path-beneath:read-file,read-dir:/proc
+
+# The device nodes a session cannot work without.  ioctl-dev is required on
+# the terminal: with "access fs" in force, terminal ioctls are denied unless
+# they are granted here, and an interactive shell then fails to set up job
+# control.
+rule path-beneath:read-file,write-file,ioctl-dev:/dev/tty
+rule path-beneath:read-file,write-file,ioctl-dev:/dev/pts
+rule path-beneath:read-file,write-file:/dev/null
+rule path-beneath:read-file:/dev/urandom
+rule path-beneath:read-file:/dev/zero
+
+# Scratch space.
+rule path-beneath:read-file,write-file,read-dir,make-reg,make-dir,remove-file,remove-dir,refer,truncate:/tmp
+
+# No "access net-tcp" line is present, so this policy does not restrict TCP
+# at all.  To restrict it, add "access net-tcp" and then one net-port rule
+# per port that should stay reachable.
+
+# Scope abstract sockets and signals to the domain.  This closes the abstract-
+# socket path from a confined process to an unconfined broker; it does not
+# close a broker reachable over a filesystem-named socket, an inherited
+# connection, or a received descriptor.  See the DASHLOCK section of dash(1).
+scope abstract-unix-socket,signal
