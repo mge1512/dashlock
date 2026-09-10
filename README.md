@@ -1,8 +1,12 @@
 # dashlock
 
-A fork of the Debian Almquist Shell (dash) that applies a
-[Landlock](https://docs.kernel.org/userspace-api/landlock.html) policy to
-itself before it executes anything.
+A fork of the Debian Almquist Shell (dash) that applies a kernel-enforced
+confinement policy to itself before it executes anything:
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) on Linux,
+[unveil](https://man.openbsd.org/unveil.2) and
+[pledge](https://man.openbsd.org/pledge.2) on OpenBSD.
+The backend is selected at build time; section 7 of `doc/design.md` covers
+the OpenBSD side.
 
 The policy comes from a root-owned file selected by user name. Once applied,
 the restriction is inherited by every process the session starts and cannot be
