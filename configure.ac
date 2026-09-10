@@ -230,12 +230,13 @@ if test "$enable_lineno" != "no"; then
 fi
 
 dnl ---------------------------------------------------------------------
-dnl dashlock: Landlock self-confinement.
+dnl dashlock: kernel-enforced self-confinement.
 dnl
-dnl Off unless linux/landlock.h is present.  --enable-dashlock makes a
-dnl missing header a hard error instead of a silent downgrade, so that a
-dnl build expected to produce a confining shell cannot quietly produce a
-dnl plain one.
+dnl Off unless an enforcement backend is detected: Landlock where
+dnl linux/landlock.h is present, unveil and pledge where those system
+dnl calls link.  --enable-dashlock makes a missing backend a hard error
+dnl instead of a silent downgrade, so that a build expected to produce a
+dnl confining shell cannot quietly produce a plain one.
 dnl ---------------------------------------------------------------------
 
 AC_ARG_ENABLE(dashlock,
@@ -264,13 +265,21 @@ AC_ARG_WITH(dashlock-libdir,
 	[with_dashlock_libdir=/usr/lib/dashlock])
 
 use_dashlock=no
+dashlock_backend=none
 if test "$enable_dashlock" != "no"; then
 	AC_CHECK_HEADERS([linux/landlock.h],
 			 [have_landlock_h=yes], [have_landlock_h=no])
+	AC_CHECK_FUNCS(unveil pledge)
 	if test "$have_landlock_h" = "yes"; then
+		dashlock_backend=landlock
+	elif test "$ac_cv_func_unveil" = "yes" && \
+	     test "$ac_cv_func_pledge" = "yes"; then
+		dashlock_backend=unveil
+	fi
+	if test "$dashlock_backend" != "none"; then
 		use_dashlock=yes
 	elif test "$enable_dashlock" = "yes"; then
-		AC_MSG_ERROR([--enable-dashlock requires linux/landlock.h])
+		AC_MSG_ERROR([--enable-dashlock requires linux/landlock.h or unveil/pledge])
 	fi
 fi
 
@@ -285,10 +294,15 @@ if test "$use_dashlock" = "yes" && test "$ac_cv_func_getpwuid_r" != "yes"; then
 	fi
 	AC_MSG_WARN([getpwuid_r not found; dashlock support disabled])
 	use_dashlock=no
+	dashlock_backend=none
 fi
 
 AC_MSG_CHECKING([whether to build dashlock support])
-AC_MSG_RESULT($use_dashlock)
+if test "$use_dashlock" = "yes"; then
+	AC_MSG_RESULT([yes, backend $dashlock_backend])
+else
+	AC_MSG_RESULT([no])
+fi
 
 if test "$use_dashlock" = "yes"; then
 	case "$with_dashlock_etcdir" in
@@ -305,7 +319,17 @@ if test "$use_dashlock" = "yes"; then
 	with_dashlock_etcdir=`printf %s "$with_dashlock_etcdir" | sed 's,/*$,,'`
 	with_dashlock_libdir=`printf %s "$with_dashlock_libdir" | sed 's,/*$,,'`
 	AC_DEFINE([USE_DASHLOCK], 1,
-		  [Define to build Landlock self-confinement support])
+		  [Define to build dashlock self-confinement support])
+	case "$dashlock_backend" in
+	landlock)
+		AC_DEFINE([DASHLOCK_BACKEND_LANDLOCK], 1,
+			  [Define to enforce with Linux Landlock])
+		;;
+	unveil)
+		AC_DEFINE([DASHLOCK_BACKEND_UNVEIL], 1,
+			  [Define to enforce with OpenBSD unveil and pledge])
+		;;
+	esac
 	AC_DEFINE_UNQUOTED([DASHLOCK_NAME], ["$with_dashlock_name"],
 			   [Invocation name that triggers confinement])
 	AC_DEFINE_UNQUOTED([DASHLOCK_ETCDIR], ["$with_dashlock_etcdir"],
@@ -319,6 +343,7 @@ if test "$use_dashlock" = "yes"; then
 fi
 
 AM_CONDITIONAL([BUILD_DASHLOCK], [test "$use_dashlock" = "yes"])
+AM_CONDITIONAL([BUILD_DASHLOCK_UNVEIL], [test "$dashlock_backend" = "unveil"])
 AC_SUBST([DASHLOCK_ETCDIR], [$with_dashlock_etcdir])
 AC_SUBST([DASHLOCK_LIBDIR], [$with_dashlock_libdir])
 

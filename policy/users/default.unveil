@@ -1,0 +1,46 @@
+# /usr/lib/dashlock/users/default  (unveil backend)
+#
+# Vendor default policy for the unveil and pledge backend on OpenBSD.  It
+# applies to any account that has no file of its own under
+# /etc/dashlock/users/ or /usr/lib/dashlock/users/.
+#
+# It is a filesystem allowlist for the paths unveil mediates.  Within that
+# scope it grants no access to any home directory: a session can start
+# programs and use /tmp, which is enough to log in and diagnose the setup
+# and not enough to do work.  Write a policy for the account in
+# /etc/dashlock/users/<name>.
+#
+# Outside that scope this policy restricts little.  The execution promises
+# default to every promise this build knows, so pledge keeps the unveil set
+# alive across execve and restricts almost nothing by itself; add a
+# "pledge" line to narrow them.  Network access is not restricted, and a
+# policy that tried ("access net-tcp") would be refused by this backend.
+# Descriptors inherited from before startup stay usable, which is how the
+# interactive terminal keeps working alongside the /dev/tty rule below.
+# See the DASHLOCK section of dash(1).
+#
+# No abi-min, abi-max or scope lines: the first two are Landlock
+# preconditions this backend ignores, and a scope line would be refused.
+
+access fs
+
+# Programs, libraries, the runtime linker.  /bin and /sbin are real
+# directories on OpenBSD, not symbolic links into /usr, so they need their
+# own rules.  /usr covers /usr/lib and /usr/libexec/ld.so.
+rule path-beneath:execute,read-file,read-dir:/bin
+rule path-beneath:execute,read-file,read-dir:/sbin
+rule path-beneath:execute,read-file,read-dir:/usr
+
+# Configuration.
+rule path-beneath:read-file,read-dir:/etc
+
+# The device nodes a session cannot work without.  The controlling
+# terminal is reached through /dev/tty; the pty slave itself stays usable
+# through the inherited descriptors.
+rule path-beneath:read-file,write-file:/dev/tty
+rule path-beneath:read-file,write-file:/dev/null
+rule path-beneath:read-file:/dev/urandom
+rule path-beneath:read-file:/dev/zero
+
+# Scratch space.
+rule path-beneath:read-file,write-file,read-dir,make-reg,make-dir,remove-file,remove-dir,refer,truncate:/tmp

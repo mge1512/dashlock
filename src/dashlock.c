@@ -29,7 +29,9 @@
  */
 
 /*
- * Implements 2026-08-27-dashlock.spec.md.
+ * Implements dashlock.spec.md, version 0.6.0.  The enforcement backend is
+ * selected at build time: DASHLOCK_BACKEND_LANDLOCK (Linux) or
+ * DASHLOCK_BACKEND_UNVEIL (OpenBSD), exactly one per build.
  *
  * Deliberate properties of this file, each of which is a requirement rather
  * than a style choice:
@@ -39,10 +41,11 @@
  *     on this code path.
  *   - It uses no stdio.  Diagnostics go to file descriptor 2 through write(2),
  *     because the shell output layer is not initialised yet.
- *   - It defines every Landlock constant, structure and system call number
- *     itself.  The uapi header on the build host may predate the constants
- *     used here, and the structure passed to the kernel is size-tagged, so
- *     relying on the header layout would be wrong in both directions.
+ *   - The Landlock backend defines every constant, structure and system
+ *     call number itself.  The uapi header on the build host may predate
+ *     the constants used here, and the structure passed to the kernel is
+ *     size-tagged, so relying on the header layout would be wrong in both
+ *     directions.
  *   - Every failure path terminates.  There is no code path that applies part
  *     of a policy and continues.
  */
@@ -78,8 +81,6 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/prctl.h>
-#include <sys/syscall.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -109,6 +110,79 @@
 #ifndef DASHLOCK_LIBDIR
 #define DASHLOCK_LIBDIR "/usr/lib/dashlock"
 #endif
+
+/*
+ * Exactly one enforcement backend per build; configure defines it.  For a
+ * standalone review compile without the configuration header, default to the
+ * Landlock backend so that the historical behavior of such compiles is
+ * unchanged.
+ */
+#if !defined(DASHLOCK_BACKEND_LANDLOCK) && !defined(DASHLOCK_BACKEND_UNVEIL)
+#define DASHLOCK_BACKEND_LANDLOCK 1
+#endif
+#if defined(DASHLOCK_BACKEND_LANDLOCK) && defined(DASHLOCK_BACKEND_UNVEIL)
+#error "dashlock.c: exactly one enforcement backend must be selected"
+#endif
+
+#ifdef DASHLOCK_BACKEND_LANDLOCK
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Access-right bit representation, common to every backend            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The bit values equal the Landlock uapi constants and serve as the
+ * internal representation of parsed access rights on every backend.  The
+ * unveil backend projects them onto its four permission classes at
+ * enforcement time (see the PortableClass mapping in the specification);
+ * the Landlock backend passes them to the kernel as they are.
+ */
+
+#define DL_FS_EXECUTE     (1ULL << 0)
+#define DL_FS_WRITE_FILE  (1ULL << 1)
+#define DL_FS_READ_FILE   (1ULL << 2)
+#define DL_FS_READ_DIR    (1ULL << 3)
+#define DL_FS_REMOVE_DIR  (1ULL << 4)
+#define DL_FS_REMOVE_FILE (1ULL << 5)
+#define DL_FS_MAKE_CHAR   (1ULL << 6)
+#define DL_FS_MAKE_DIR    (1ULL << 7)
+#define DL_FS_MAKE_REG    (1ULL << 8)
+#define DL_FS_MAKE_SOCK   (1ULL << 9)
+#define DL_FS_MAKE_FIFO   (1ULL << 10)
+#define DL_FS_MAKE_BLOCK  (1ULL << 11)
+#define DL_FS_MAKE_SYM    (1ULL << 12)
+#define DL_FS_REFER       (1ULL << 13)
+#define DL_FS_TRUNCATE    (1ULL << 14)
+#define DL_FS_IOCTL_DEV   (1ULL << 15)
+
+#define DL_NET_BIND_TCP    (1ULL << 0)
+#define DL_NET_CONNECT_TCP (1ULL << 1)
+
+#define DL_SCOPE_ABSTRACT_UNIX_SOCKET (1ULL << 0)
+#define DL_SCOPE_SIGNAL               (1ULL << 1)
+
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0200000
+#endif
+
+/*
+ * Directory-walk open flags for path verification.  The Landlock backend
+ * opens with O_PATH, which needs no read permission on the directory.
+ * OpenBSD has no O_PATH; the unveil backend opens the directories for
+ * reading, which the policy-directory precondition (root-owned, mode 0755)
+ * guarantees for policy paths and which is a documented limitation for
+ * rule paths with search-only components.
+ */
+#ifdef DASHLOCK_BACKEND_LANDLOCK
+#define DL_WALK_FLAGS (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+#else
+#define DL_WALK_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+#endif
+
+#ifdef DASHLOCK_BACKEND_LANDLOCK
 
 /* ------------------------------------------------------------------ */
 /* Landlock uapi, defined locally.  See the note at the top.           */
@@ -157,37 +231,11 @@ dl_sys_openat2(int dirfd, const char *path, struct dl_open_how *how,
 #ifndef O_PATH
 #define O_PATH 010000000
 #endif
-#ifndef O_DIRECTORY
-#define O_DIRECTORY 0200000
-#endif
 
 #define DL_CREATE_RULESET_VERSION (1U << 0)
 
 #define DL_RULE_PATH_BENEATH 1
 #define DL_RULE_NET_PORT     2
-
-#define DL_FS_EXECUTE     (1ULL << 0)
-#define DL_FS_WRITE_FILE  (1ULL << 1)
-#define DL_FS_READ_FILE   (1ULL << 2)
-#define DL_FS_READ_DIR    (1ULL << 3)
-#define DL_FS_REMOVE_DIR  (1ULL << 4)
-#define DL_FS_REMOVE_FILE (1ULL << 5)
-#define DL_FS_MAKE_CHAR   (1ULL << 6)
-#define DL_FS_MAKE_DIR    (1ULL << 7)
-#define DL_FS_MAKE_REG    (1ULL << 8)
-#define DL_FS_MAKE_SOCK   (1ULL << 9)
-#define DL_FS_MAKE_FIFO   (1ULL << 10)
-#define DL_FS_MAKE_BLOCK  (1ULL << 11)
-#define DL_FS_MAKE_SYM    (1ULL << 12)
-#define DL_FS_REFER       (1ULL << 13)
-#define DL_FS_TRUNCATE    (1ULL << 14)
-#define DL_FS_IOCTL_DEV   (1ULL << 15)
-
-#define DL_NET_BIND_TCP    (1ULL << 0)
-#define DL_NET_CONNECT_TCP (1ULL << 1)
-
-#define DL_SCOPE_ABSTRACT_UNIX_SOCKET (1ULL << 0)
-#define DL_SCOPE_SIGNAL               (1ULL << 1)
 
 struct dl_ruleset_attr {
 	uint64_t handled_access_fs;	/* ABI 1 */
@@ -223,6 +271,8 @@ dl_sys_restrict(int fd, uint32_t flags)
 	return syscall(__NR_landlock_restrict_self, fd, flags);
 }
 
+#endif /* DASHLOCK_BACKEND_LANDLOCK */
+
 /* ------------------------------------------------------------------ */
 /* Limits                                                              */
 /* ------------------------------------------------------------------ */
@@ -232,6 +282,7 @@ dl_sys_restrict(int fd, uint32_t flags)
 #define DL_KEY_MAX   256
 #define DL_PATH_RULES_MAX 64
 #define DL_NET_RULES_MAX  32
+#define DL_PLEDGE_MAX 1024	/* built execpromises string (unveil backend) */
 
 /* ------------------------------------------------------------------ */
 /* Name tables.  Names match setpriv(1) from util-linux.               */
@@ -275,6 +326,23 @@ static const struct dl_name_bit dl_scope_names[] = {
 	{ NULL,                   0,                             0 }
 };
 
+/*
+ * OpenBSD pledge promise names known to this implementation: the state of
+ * pledgereq[] in sys/kern/kern_pledge.c, OpenBSD 7.9 and -current as of
+ * 2026-09-09.  "tmppath" was removed upstream and is deliberately absent.
+ * The table is compiled on every backend, because parse-policy validates
+ * pledge directives everywhere; only the unveil backend enforces them.
+ * The bit for a name is (1 << index), used in dl_policy.pledge_bits.
+ */
+static const char *const dl_pledge_names[] = {
+	"audio", "bpf", "chown", "cpath", "disklabel", "dns", "dpath",
+	"drm", "error", "exec", "fattr", "flock", "getpw", "id", "inet",
+	"mcast", "pf", "proc", "prot_exec", "ps", "recvfd", "route",
+	"rpath", "sendfd", "settime", "stdio", "tape", "tty", "unix",
+	"unveil", "video", "vminfo", "vmm", "wpath", "wroute",
+	NULL
+};
+
 /* ------------------------------------------------------------------ */
 /* Policy representation                                               */
 /* ------------------------------------------------------------------ */
@@ -305,6 +373,8 @@ struct dl_policy {
 	int want_all_fs;
 	int want_all_net;
 	int abi_floor;
+	uint64_t pledge_bits;	/* bit (1 << i) set: dl_pledge_names[i] */
+	int have_pledge;	/* a pledge directive was present */
 	int npath;
 	int nnet;
 	struct dl_path_rule path_rules[DL_PATH_RULES_MAX];
@@ -489,6 +559,8 @@ dl_lookup(const struct dl_name_bit *table, const char *name)
 	return NULL;
 }
 
+#ifdef DASHLOCK_BACKEND_LANDLOCK
+
 /* ------------------------------------------------------------------ */
 /* Kernel ABI                                                          */
 /* ------------------------------------------------------------------ */
@@ -527,6 +599,8 @@ dl_mask(const struct dl_name_bit *table, int abi)
 			m |= e->bit;
 	return m;
 }
+
+#endif /* DASHLOCK_BACKEND_LANDLOCK */
 
 /* ------------------------------------------------------------------ */
 /* BEHAVIOR/INTERNAL: open-and-validate-policy-file                    */
@@ -580,8 +654,9 @@ dl_open_verified(const char *path, struct stat *stp)
 	memcpy(buf, path, n + 1);
 
 	/* The root directory itself must be root-owned and not group- or
-	 * other-writable; open it O_PATH and check the descriptor. */
-	dirfd = open("/", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	 * other-writable; open it with the walk flags and check the
+	 * descriptor. */
+	dirfd = open("/", DL_WALK_FLAGS);
 	if (dirfd < 0)
 		dl_refuse_errno("cannot open / for ", path, errno);
 	if (fstat(dirfd, &st) != 0) {
@@ -595,7 +670,8 @@ dl_open_verified(const char *path, struct stat *stp)
 	/*
 	 * Walk the components between the leading and trailing slashes.  Each
 	 * intermediate component is opened relative to its verified parent
-	 * with O_PATH|O_DIRECTORY|O_NOFOLLOW and checked on its descriptor.
+	 * with DL_WALK_FLAGS (O_NOFOLLOW included) and checked on its
+	 * descriptor.
 	 */
 	p = buf + 1;
 	for (;;) {
@@ -619,7 +695,7 @@ dl_open_verified(const char *path, struct stat *stp)
 		component = buf;
 
 		nextfd = openat(dirfd, p,
-				O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+				DL_WALK_FLAGS);
 		err = errno;
 		close(dirfd);
 		if (nextfd < 0) {
@@ -936,6 +1012,52 @@ dl_parse_access(struct dl_policy *pol, char *rest)
 	dl_refusev(parts);
 }
 
+/*
+ * pledge directive: space-separated promise names, validated against
+ * dl_pledge_names on every backend so that a typo is caught on the machine
+ * where the policy was written, not only on the one where it is enforced.
+ * The union across several pledge lines is taken.  Only the unveil backend
+ * enforces the result; the Landlock backend refuses the directive at
+ * enforcement time, per the backend contract.
+ */
+static void
+dl_parse_pledge(struct dl_policy *pol, char *rest)
+{
+	char *p = rest;
+	int found = 0;
+
+	while (*p != '\0') {
+		char *tok = p;
+		int i;
+
+		while (*p != '\0' && !dl_isspace((unsigned char)*p))
+			p++;
+		if (*p != '\0') {
+			*p++ = '\0';
+			while (*p != '\0' && dl_isspace((unsigned char)*p))
+				p++;
+		}
+		for (i = 0; dl_pledge_names[i] != NULL; i++)
+			if (strcmp(dl_pledge_names[i], tok) == 0)
+				break;
+		if (dl_pledge_names[i] == NULL) {
+			const char *parts[6];
+
+			parts[0] = "unknown promise name ";
+			parts[1] = tok;
+			parts[2] = " in ";
+			parts[3] = pol->source;
+			parts[4] = NULL;
+			dl_refusev(parts);
+		}
+		pol->pledge_bits |= (uint64_t)1 << i;
+		found = 1;
+	}
+	if (!found)
+		dl_refuse("pledge without promises in ", pol->source, "");
+	pol->have_pledge = 1;
+}
+
 static void
 dl_parse_abi_min(struct dl_policy *pol, const char *s)
 {
@@ -1033,6 +1155,8 @@ dl_parse(struct dl_policy *pol)
 			dl_parse_access(pol, rest);
 		else if (strcmp(kw, "rule") == 0)
 			dl_parse_rule(pol, rest);
+		else if (strcmp(kw, "pledge") == 0)
+			dl_parse_pledge(pol, rest);
 		else if (strcmp(kw, "scope") == 0)
 			pol->scoped |= dl_parse_access_list(pol,
 							    dl_scope_names,
@@ -1104,8 +1228,10 @@ dl_parse(struct dl_policy *pol)
 	}
 }
 
+#ifdef DASHLOCK_BACKEND_LANDLOCK
+
 /* ------------------------------------------------------------------ */
-/* BEHAVIOR/INTERNAL: compute-required-abi                             */
+/* BEHAVIOR/INTERNAL: compute-required-abi (landlock backend)          */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -1137,6 +1263,8 @@ dl_required_abi(const struct dl_policy *pol)
 	}
 	return req;
 }
+
+#endif /* DASHLOCK_BACKEND_LANDLOCK */
 
 /* ------------------------------------------------------------------ */
 /* BEHAVIOR/INTERNAL: locate-policy-file                               */
@@ -1191,8 +1319,10 @@ dl_load(struct dl_policy *pol, const char *key, int is_narrow)
 	dl_refuse("no policy for user ", key, "");
 }
 
+#ifdef DASHLOCK_BACKEND_LANDLOCK
+
 /* ------------------------------------------------------------------ */
-/* BEHAVIOR: enforce-policy                                            */
+/* BEHAVIOR/INTERNAL: enforce-policy-landlock                          */
 /* ------------------------------------------------------------------ */
 
 static void
@@ -1291,6 +1421,282 @@ dl_apply(const struct dl_policy *pol)
 	}
 	close(fd);
 }
+
+#endif /* DASHLOCK_BACKEND_LANDLOCK */
+
+#ifdef DASHLOCK_BACKEND_UNVEIL
+
+/* ------------------------------------------------------------------ */
+/* BEHAVIOR/INTERNAL: enforce-policy-unveil                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Declared in unistd.h on OpenBSD.  Declared here as well so that this
+ * section compile-checks on a non-OpenBSD review host (see the hints
+ * file); an identical redeclaration is legal C.
+ */
+int unveil(const char *, const char *);
+int pledge(const char *, const char *);
+
+/*
+ * The PortableClass mapping from the specification.  One-directional
+ * coarsening: a class may cover more than the named rights, never less.
+ * ioctl-dev maps to no class: unveil does not mediate device ioctl by
+ * path; those fall under the pledge promises.
+ */
+#define DL_UV_R (DL_FS_READ_FILE | DL_FS_READ_DIR)
+#define DL_UV_W (DL_FS_WRITE_FILE | DL_FS_TRUNCATE)
+#define DL_UV_X (DL_FS_EXECUTE)
+#define DL_UV_C (DL_FS_MAKE_CHAR | DL_FS_MAKE_DIR | DL_FS_MAKE_REG | \
+		 DL_FS_MAKE_SOCK | DL_FS_MAKE_FIFO | DL_FS_MAKE_BLOCK | \
+		 DL_FS_MAKE_SYM | DL_FS_REMOVE_DIR | DL_FS_REMOVE_FILE | \
+		 DL_FS_REFER)
+
+/*
+ * Build the unveil permission string for a rule, fixed order "rwxc".
+ * out must hold 5 bytes.  Returns the number of classes granted; 0 means
+ * the rule maps to nothing this backend mediates and the caller refuses.
+ */
+static int
+dl_uv_classes(uint64_t access, char *out)
+{
+	int j = 0;
+
+	if ((access & DL_UV_R) != 0)
+		out[j++] = 'r';
+	if ((access & DL_UV_W) != 0)
+		out[j++] = 'w';
+	if ((access & DL_UV_X) != 0)
+		out[j++] = 'x';
+	if ((access & DL_UV_C) != 0)
+		out[j++] = 'c';
+	out[j] = '\0';
+	return j;
+}
+
+/*
+ * Verified rule paths, one slot per rule.  pfd is the open descriptor of
+ * the verified parent directory; leaf is the final component, re-resolved
+ * by name inside unveil(2), because OpenBSD has no handle-based unveil.
+ * pfd -1 marks a rule on the root directory, which has no parent.  File
+ * scope rather than the stack: 64 slots with a name buffer each would be
+ * a large frame, and dashlock_init runs strictly single-threaded before
+ * the shell starts.
+ */
+struct dl_uv_slot {
+	int pfd;
+	char leaf[256];		/* NAME_MAX + 1 on OpenBSD */
+};
+
+static struct dl_uv_slot dl_uv_slots[DL_PATH_RULES_MAX];
+
+/*
+ * Verify one rule path on open directory handles, before any unveil call.
+ * After the first unveil the process's own openat walks would already be
+ * filtered by the partial set, while unveil(2) itself resolves
+ * unrestricted, so verification of every rule must complete before the
+ * first unveil (spec, enforce-policy-unveil).  Each intermediate
+ * component is opened O_NOFOLLOW relative to its verified parent, which
+ * pins the ancestors by handle.  The final component is checked with
+ * fstatat(AT_SYMLINK_NOFOLLOW) rather than opened, because opening a
+ * device node has side effects: /dev/tty fails with ENXIO without a
+ * controlling terminal, and a policy rule must not depend on that.  The
+ * leaf is then re-resolved by name inside unveil(2); that one-system-call
+ * window is the documented residual difference from openat2 on Linux.
+ */
+static void
+dl_uv_verify(const char *path, struct dl_uv_slot *slot)
+{
+	char buf[DL_PATH_MAX];
+	struct stat st;
+	size_t n = strlen(path);
+	char *p;
+	int dirfd;
+
+	if (n >= sizeof(buf))
+		dl_refuse_errno("cannot open rule path ", path, ENAMETOOLONG);
+	memcpy(buf, path, n + 1);
+	while (n > 1 && buf[n - 1] == '/')
+		buf[--n] = '\0';
+
+	if (buf[1] == '\0') {
+		/*
+		 * The root itself: no parent to pin, and "/" cannot be a
+		 * symbolic link.  Applied later as unveil("/", ...).
+		 */
+		slot->pfd = -1;
+		slot->leaf[0] = '/';
+		slot->leaf[1] = '\0';
+		return;
+	}
+
+	dirfd = open("/", DL_WALK_FLAGS);
+	if (dirfd < 0)
+		dl_refuse_errno("cannot open rule path ", path, errno);
+
+	p = buf + 1;
+	for (;;) {
+		char *slash = strchr(p, '/');
+		int next;
+
+		if (slash == NULL)
+			break;
+		*slash = '\0';
+		next = openat(dirfd, p, DL_WALK_FLAGS);
+		if (next < 0) {
+			int err = errno;
+
+			close(dirfd);
+			dl_refuse_errno("cannot open rule path ", path, err);
+		}
+		close(dirfd);
+		dirfd = next;
+		p = slash + 1;
+	}
+
+	if (fstatat(dirfd, p, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+		int err = errno;
+
+		close(dirfd);
+		dl_refuse_errno("cannot open rule path ", path, err);
+	}
+	if (S_ISLNK(st.st_mode)) {
+		close(dirfd);
+		dl_refuse_errno("cannot open rule path ", path, ELOOP);
+	}
+	if (strlen(p) >= sizeof(slot->leaf)) {
+		close(dirfd);
+		dl_refuse_errno("cannot open rule path ", path, ENAMETOOLONG);
+	}
+	memcpy(slot->leaf, p, strlen(p) + 1);
+	slot->pfd = dirfd;
+}
+
+/*
+ * The enforcement sequence of the spec, steps 1 to 10 in order.  The
+ * unveil set and its lock survive execve only while execution promises
+ * are in force, so both are installed here, before the shell reads
+ * anything.
+ */
+static void
+dl_unveil_apply(const struct dl_policy *pol)
+{
+	char promises[DL_PLEDGE_MAX];
+	int saved;
+	int i;
+
+	/*
+	 * Backend contract, rule 1: a restriction this backend cannot
+	 * enforce is a refusal, never a skip.  abi-min and abi-max are
+	 * Landlock preconditions and gate nothing here (rule 2).
+	 */
+	if (pol->want_all_net || pol->handled_net != 0)
+		dl_refuse("backend cannot enforce access net-tcp in ",
+			  pol->source, "");
+	if (pol->nnet > 0)
+		dl_refuse("backend cannot enforce rule net-port in ",
+			  pol->source, "");
+	if (pol->scoped != 0)
+		dl_refuse("backend cannot enforce scope in ",
+			  pol->source, "");
+	if (!pol->want_all_fs && pol->handled_fs != 0) {
+		const struct dl_name_bit *e;
+		const char *parts[6];
+
+		for (e = dl_fs_names; e->name != NULL; e++)
+			if ((pol->handled_fs & e->bit) != 0)
+				break;
+		parts[0] = "backend cannot enforce access fs:";
+		parts[1] = (e->name != NULL) ? e->name : "";
+		parts[2] = " in ";
+		parts[3] = pol->source;
+		parts[4] = NULL;
+		dl_refusev(parts);
+	}
+	for (i = 0; i < pol->npath; i++) {
+		char cls[5];
+
+		if (dl_uv_classes(pol->path_rules[i].access, cls) == 0) {
+			const char *parts[4];
+
+			parts[0] = "rule for ";
+			parts[1] = pol->path_rules[i].path;
+			parts[2] = " grants nothing this backend mediates";
+			parts[3] = NULL;
+			dl_refusev(parts);
+		}
+	}
+
+	saved = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (saved < 0)
+		dl_refuse_errno("cannot save working directory", NULL, errno);
+
+	for (i = 0; i < pol->npath; i++)
+		dl_uv_verify(pol->path_rules[i].path, &dl_uv_slots[i]);
+
+	for (i = 0; i < pol->npath; i++) {
+		char cls[5];
+
+		(void)dl_uv_classes(pol->path_rules[i].access, cls);
+		if (dl_uv_slots[i].pfd == -1) {
+			if (unveil("/", cls) != 0)
+				dl_refuse_errno("cannot unveil ",
+						pol->path_rules[i].path,
+						errno);
+			continue;
+		}
+		if (fchdir(dl_uv_slots[i].pfd) != 0)
+			dl_refuse_errno("cannot unveil ",
+					pol->path_rules[i].path, errno);
+		if (unveil(dl_uv_slots[i].leaf, cls) != 0)
+			dl_refuse_errno("cannot unveil ",
+					pol->path_rules[i].path, errno);
+		close(dl_uv_slots[i].pfd);
+	}
+
+	if (unveil(NULL, NULL) != 0)
+		dl_refuse_errno("cannot lock unveil", NULL, errno);
+
+	/*
+	 * Execution promises are what the kernel requires for the unveil
+	 * set to survive execve (see the hints file and design.md section
+	 * 7).  The default is every promise this build knows: the
+	 * restriction of this design is the filesystem allowlist, so
+	 * pledge restricts as little as the mechanism allows.  A pledge
+	 * directive replaces the default.  An unknown name on an older
+	 * kernel fails the whole pledge call, and the session refuses:
+	 * version skew fails closed.
+	 */
+	{
+		size_t n = 0;
+
+		for (i = 0; dl_pledge_names[i] != NULL; i++) {
+			size_t l;
+
+			if (pol->have_pledge &&
+			    (pol->pledge_bits & ((uint64_t)1 << i)) == 0)
+				continue;
+			l = strlen(dl_pledge_names[i]);
+			if (n + l + 2 > sizeof(promises))
+				dl_refuse("cannot set execution promises",
+					  NULL, NULL);
+			if (n > 0)
+				promises[n++] = ' ';
+			memcpy(promises + n, dl_pledge_names[i], l);
+			n += l;
+		}
+		promises[n] = '\0';
+	}
+	if (pledge(NULL, promises) != 0)
+		dl_refuse_errno("cannot set execution promises", NULL, errno);
+
+	if (fchdir(saved) != 0)
+		dl_refuse_errno("cannot restore working directory", NULL,
+				errno);
+	close(saved);
+}
+
+#endif /* DASHLOCK_BACKEND_UNVEIL */
 
 /* ------------------------------------------------------------------ */
 /* BEHAVIOR/INTERNAL: resolve-user-key                                 */
@@ -1431,6 +1837,16 @@ dl_consume_narrow(int *argcp, char **argv)
 	if (!dl_valid_narrow_name(argv[2]))
 		dl_refuse("invalid narrow policy name", NULL, NULL);
 
+#ifdef DASHLOCK_BACKEND_UNVEIL
+	/*
+	 * Spec, consume-narrow-argument step 4: unveil sets do not
+	 * intersect, so this backend has no narrowing layer.  Refusing
+	 * here, before any policy file is read, shows the administrator
+	 * the actual limitation instead of a missing-file message.
+	 */
+	dl_refuse("narrowing is not supported by this backend", NULL, NULL);
+#endif
+
 	name = argv[2];
 	for (i = 1; argv[i + 2] != NULL; i++)
 		argv[i] = argv[i + 2];
@@ -1457,7 +1873,9 @@ dashlock_init(int *argcp, char **argv)
 	struct dl_policy narrow;
 	const char *narrow_name = NULL;
 	char key[DL_KEY_MAX];
+#ifdef DASHLOCK_BACKEND_LANDLOCK
 	int abi;
+#endif
 
 #ifdef DASHLOCK_NAME_GATE
 	/*
@@ -1515,6 +1933,19 @@ dashlock_init(int *argcp, char **argv)
 	dl_load(&base, key, 0);
 	if (narrow_name != NULL)
 		dl_load(&narrow, narrow_name, 1);
+
+#ifdef DASHLOCK_BACKEND_LANDLOCK
+	/*
+	 * Backend contract, rule 1: the pledge directive is a restriction
+	 * this backend cannot enforce; refusing keeps the policy's meaning
+	 * identical on both backends.
+	 */
+	if (base.have_pledge)
+		dl_refuse("backend cannot enforce pledge in ",
+			  base.source, "");
+	if (narrow_name != NULL && narrow.have_pledge)
+		dl_refuse("backend cannot enforce pledge in ",
+			  narrow.source, "");
 
 	abi = dl_abi();
 	if (base.abi_max != 0 && abi > base.abi_max) {
@@ -1574,6 +2005,11 @@ dashlock_init(int *argcp, char **argv)
 	dl_apply(&base);
 	if (narrow_name != NULL)
 		dl_apply(&narrow);
+#endif /* DASHLOCK_BACKEND_LANDLOCK */
+
+#ifdef DASHLOCK_BACKEND_UNVEIL
+	dl_unveil_apply(&base);
+#endif
 }
 
 #else /* !USE_DASHLOCK */

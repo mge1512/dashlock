@@ -1,6 +1,7 @@
 # dashlock.c.hints
 
-Language hints for `dashlock.spec.md`, C on Linux.
+Language hints for `dashlock.spec.md`: C on Linux, and C on OpenBSD for the
+unveil backend.
 
 These are implementation facts that do not belong in the specification, which
 is language-agnostic. They are advisory and cannot override a spec invariant.
@@ -11,8 +12,10 @@ Where a hint and the spec disagree, the spec wins and the hint is wrong.
 - Base: dash 0.5.13.5 (Herbert Xu). The addition is two new files, `src/dashlock.c`
   and `src/dashlock.h`, plus a two-line hook in `src/main.c` and build glue in
   `configure.ac` and `src/Makefile.am`.
-- Platform floor: Linux 6.12, Landlock ABI 6. Build-configurable name gate,
-  trigger name, and policy directories.
+- Platform floor: Linux 6.12 (Landlock ABI 6), or OpenBSD 7.9 (unveil and
+  pledge). Build-configurable name gate, trigger name, and policy
+  directories; the enforcement backend is selected by configure, one per
+  build.
 - The hook is the first statement of `main()`:
 
   ```c
@@ -173,8 +176,9 @@ so the `argv[0] == ""` case reaches the gate as an ordinary non-trigger name.
 ## Fixed limits (not in the spec)
 
 `DL_FILE_MAX` 65536, `DL_PATH_MAX` 4096, `DL_PATH_RULES_MAX` 64,
-`DL_NET_RULES_MAX` 32, `DL_KEY_MAX` 256. All produce a refusal when exceeded,
-so they are fail-closed. They are documented in the manual page, not the spec,
+`DL_NET_RULES_MAX` 32, `DL_KEY_MAX` 256, and on the unveil backend
+`DL_PLEDGE_MAX` 1024 for the built promise string. All produce a refusal
+when exceeded, so they are fail-closed. They are documented in the manual page, not the spec,
 because the spec is the reviewable source of confinement decisions and these
 are implementation ceilings, not policy semantics. If a deployment needs more
 rules, raise the constant and rebuild.
@@ -183,8 +187,8 @@ rules, raise the constant and rebuild.
 
 | configure option | default | effect |
 | --- | --- | --- |
-| `--disable-dashlock` | enabled where `linux/landlock.h` is present | remove the feature |
-| `--enable-dashlock` | | make a missing header or missing `getpwuid_r` a hard error |
+| `--disable-dashlock` | enabled where a backend is detected | remove the feature |
+| `--enable-dashlock` | | make a missing backend or missing `getpwuid_r` a hard error |
 | `--disable-dashlock-name-gate` | gate on | confine under any invocation name |
 | `--with-dashlock-name=NAME` | `dashlock` | trigger name |
 | `--with-dashlock-etcdir=DIR` | `/etc/dashlock` | admin policy dir, must be absolute |
@@ -193,12 +197,151 @@ rules, raise the constant and rebuild.
 `dashlock.c` also compiles standalone for review: the config macros have
 in-file defaults under `#ifndef`, and unit drivers `#include "dashlock.c"`
 directly to exercise `dl_consume_narrow`, `dl_required_abi`, `dl_parse_abi_min`,
-and `dl_valid_user_key` without a kernel.
+and `dl_valid_user_key` without a kernel. With `-DDASHLOCK_BACKEND_UNVEIL`
+and stub declarations for `unveil` and `pledge`, the unveil section
+compile-checks on a Linux review host.
+
+## OpenBSD backend: kernel facts the code relies on
+
+Verified in openbsd/src at master, 2026-09-09. The manual pages do not state
+the first item, and the backend design depends on it.
+
+- `sys/kern/kern_exec.c`, end of `sys_execve` setup: when `PS_EXECPLEDGE` is
+  set, the new image gets `ps_pledge = ps_execpledge` and the unveil state is
+  kept. Otherwise the kernel calls `unveil_destroy()` and clears
+  `ps_uvdone`; the comment reads "Clear our unveil paths out so the child
+  starts afresh". Only execpromises keep the unveil set alive across
+  `execve`.
+- `PS_EXECPLEDGE` is not cleared by `execve`, so grandchildren re-enter the
+  same branch: the confinement is transitive.
+- `sys/kern/kern_exec.c`, permission checks: a set-user-ID or set-group-ID
+  image under `PS_EXECPLEDGE` fails with `EACCES` before it runs. This is
+  the OpenBSD counterpart of `no_new_privs`; it blocks where Linux
+  de-privileges.
+- `sys_unveil` in `sys/kern/vfs_syscalls.c`: `unveil(NULL, NULL)` sets
+  `ps_uvdone = 1`; any later `unveil()` returns plain `EPERM`, no kill. An
+  unlocked process may add unveils anywhere it has any access, so the lock
+  is mandatory. The `namei` call inside `sys_unveil` does not set
+  `ni_unveil`, so unveil's own path resolution is not filtered by earlier
+  unveils; the process's other system calls are.
+- `sys_unveil` resolves the given path with `FOLLOW`: the kernel follows
+  symbolic links in the argument. Symlink refusal is therefore our job,
+  before the call, and the final component stays name-resolved inside the
+  kernel (see the sequence below).
+- `sys_pledge` in `sys/kern/kern_pledge.c`: `pledge(NULL, execpromises)`
+  sets `ps_execpledge` and `PS_EXECPLEDGE` without touching the caller's own
+  promises. Promises and execpromises are only reducible afterwards; parse
+  errors fail the call as a whole with `EINVAL`. One table, `pledgereq[]`,
+  serves both arguments.
+- `sys/sys/proc.h`: `PS_PLEDGE` and `PS_EXECPLEDGE` are in
+  `PS_FLAGS_INHERITED_ON_FORK`; `ps_pledge` and `ps_execpledge` sit in the
+  fork copy range; `unveil_copy()` copies the path set and `ps_uvdone`.
+  Fork inherits everything; exec inherits under execpromises.
+
+One reviewed non-issue: `sys_pledge` destroys the unveil state when a
+process pledges promises containing none of rpath, wpath, cpath, dpath,
+exec, unix, unveil. That process has also given up `execve` and every
+path-taking call, so it cannot produce an unconfined descendant; the
+destruction only releases vnode references.
+
+## OpenBSD backend: enforcement sequence
+
+`dl_unveil_apply()` under `#ifdef DASHLOCK_BACKEND_UNVEIL`. The order is
+normative (spec, enforce-policy-unveil); the reasons live here.
+
+1. Contract checks first: refuse `handled_net`/`nnet`/`want_all_net`,
+   refuse `scoped`, refuse a non-wildcard filesystem category, map every
+   rule's access to unveil classes and refuse a rule that maps to nothing.
+   All before any file descriptor is opened.
+2. Save the working directory: `open(".", O_RDONLY|O_DIRECTORY|O_CLOEXEC)`.
+   The fchdir dance below must not change what the shell later reports as
+   its working directory.
+3. Verify every rule path before the first `unveil()` call. After the first
+   unveil the process's own `openat` walks would be filtered by the partial
+   set (rule 2's components may be invisible under rule 1), while `unveil()`
+   itself resolves unrestricted; verification therefore runs to completion
+   first. The walk: open `/` and each intermediate component with
+   `openat(dirfd, comp, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`; check
+   the final component with `fstatat(dirfd, leaf, &st,
+   AT_SYMLINK_NOFOLLOW)` and refuse `S_ISLNK`. `fstatat` rather than an
+   open, because opening a device node has side effects: `/dev/tty` opens
+   fail with `ENXIO` when the process has no controlling terminal, and a
+   policy rule must not depend on that. Keep the parent directory
+   descriptor of every rule for step 4; with `DL_PATH_RULES_MAX` 64 that is
+   at most 65 descriptors plus the saved working directory, comfortably
+   under any default `openfiles` limit, and the count is bounded by the
+   rule limit.
+4. For each rule, in policy order: `fchdir(parentfd)`, then
+   `unveil(leafname, classes)` with the class string built from the mapped
+   PortableClass set in the fixed order "rwxc". A rule on "/" itself is
+   applied as `unveil("/", classes)` with no directory change: the root
+   has no parent and cannot be a symbolic link. The parent handle pins
+   every verified ancestor; only the leaf name is re-resolved by the
+   kernel. That residual one-syscall window is the documented difference
+   from `openat2` on Linux, and it requires write access to the parent
+   directory to exploit, which root-owned parents deny.
+5. `unveil(NULL, NULL)` to lock.
+6. `pledge(NULL, promises)` with the space-joined promise string: the
+   policy's pledge set when present, otherwise every entry of
+   `dl_pledge_names[]`. Build the string into a fixed buffer,
+   `DL_PLEDGE_MAX` 1024; the full current list is under 300 bytes.
+7. `fchdir(saved)` and close the saved descriptor. A failure here is a
+   refusal like any other: the shell must not start in a directory the
+   session did not choose.
+
+There is no `O_PATH` on OpenBSD, which is why the walk opens directories
+for reading; a component the account cannot read refuses, which for an
+unprivileged account includes search-only directories, and the manual page
+says so. `openat`, `fstatat`, `fchdir`, `O_DIRECTORY`, `O_NOFOLLOW`,
+`O_CLOEXEC` are all native.
+
+## OpenBSD backend: promise table
+
+`dl_pledge_names[]` is compiled unconditionally, because parse-policy
+validates pledge directives on every backend; only the enforcement is
+conditional. Snapshot of `pledgereq[]` from `sys/kern/kern_pledge.c`,
+2026-09-09, 35 names, "tmppath" removed upstream and deliberately absent:
+
+```c
+audio bpf chown cpath disklabel dns dpath drm error exec fattr flock
+getpw id inet mcast pf proc prot_exec ps recvfd route rpath sendfd
+settime stdio tape tty unix unveil video vminfo vmm wpath wroute
+```
+
+The default includes "unveil" and "error" on purpose. "unveil" because the
+inherited `ps_uvdone` lock already turns a child's `unveil()` into a clean
+`EPERM`; withholding the promise would turn the same call into a pledge
+violation and kill the child. "error" because a violation in an arbitrary,
+never-pledge-aware child should produce an error return, which is what a
+Landlock denial produces, not a `SIGABRT` kill. Version skew fails closed both
+ways: an older kernel rejects an unknown name in our list (`EINVAL`, session
+refuses), a newer kernel's new promise is missing from the list (children
+over-restricted, never under).
+
+## Backend selection in the build
+
+`configure.ac` defines exactly one of `DASHLOCK_BACKEND_LANDLOCK` and
+`DASHLOCK_BACKEND_UNVEIL`: landlock when `linux/landlock.h` is present,
+unveil when the `unveil` and `pledge` functions link, landlock preferred if
+a system ever offered both. Neither present: auto builds plain dash,
+`--enable-dashlock` fails with "requires linux/landlock.h or unveil/pledge".
+`getpwuid_r` remains a hard requirement on both. `src/dashlock.c` keeps the
+single-file layout: common code unconditional, each backend in one
+`#ifdef` section, and the standalone-compile mode gains stub declarations
+for `unveil` and `pledge` so the unveil section can be compile-checked on a
+Linux review host.
+
+Packaging note: `/usr/lib/dashlock` is an unusual vendor path on OpenBSD;
+ports would override with `--with-dashlock-libdir=/usr/local/lib/dashlock`.
+The default stays as it is because the primary target sets it, and the
+option exists.
 
 ## Known non-portable assumptions
 
-- Linux only. The file is behind `USE_DASHLOCK` and is Linux-specific by
-  nature (Landlock, `openat2`, the syscall numbers).
+- Two platforms, one per build. The file is behind `USE_DASHLOCK`; the
+  Landlock section (uapi definitions, `openat2`, the syscall numbers) is
+  behind `DASHLOCK_BACKEND_LANDLOCK`, the unveil section behind
+  `DASHLOCK_BACKEND_UNVEIL`. Common code assumes POSIX plus `getpwuid_r`.
 - x86-64 and AArch64 verified for the syscall numbers; both use the asm-generic
   numbers 437/444/445/446. A port to a different architecture must confirm them.
 - glibc and musl both provide `getpwuid_r`, `openat2` wrappers vary, which is

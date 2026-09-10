@@ -2443,9 +2443,10 @@ The process ID of the parent process of the shell.
 .Pa /usr/lib/dashlock/narrow/ Ns Ar name
 .El
 .Sh DASHLOCK
-When this shell is built with Landlock support and is invoked under the name
+When this shell is built with confinement support and is invoked under the
+name
 .Nm dashlock ,
-it applies a Landlock policy to itself before it reads
+it applies a kernel-enforced confinement policy to itself before it reads
 .Pa /etc/profile ,
 .Pa $HOME/.profile ,
 the file named by
@@ -2622,6 +2623,74 @@ Whoever builds the command line can therefore be allowed to influence the
 policy without being trusted.
 Because layers intersect, a narrowing policy must repeat every path it wants to
 keep: a path it does not mention becomes inaccessible.
+.Ss The unveil and pledge backend
+The enforcement backend is selected when the shell is built: Landlock where
+the Linux Landlock interface is available, and
+.Xr unveil 2
+with
+.Xr pledge 2
+on OpenBSD.
+One grammar and one parser serve both backends; this subsection lists what
+the unveil backend does differently.
+Everything above applies unless stated here.
+.Pp
+The unveil backend installs the policy as a locked unveil set plus
+execution promises.
+The promises are what the OpenBSD kernel requires for the unveil set to
+survive
+.Xr execve 2 ;
+they default to every promise this build knows, so they restrict little by
+themselves, and a
+.Ic pledge
+directive in the policy file, with space-separated promise names,
+replaces that default.
+Promise names are validated when the policy is parsed, on every backend.
+.Pp
+The access rights of a rule map onto the four unveil permission classes:
+.Ql r
+covers read-file and read-dir,
+.Ql w
+covers write-file and truncate,
+.Ql x
+covers execute, and
+.Ql c
+covers the make and remove rights and refer.
+The mapping may deny more than the named rights, never less.
+ioctl-dev is not path-mediated by unveil and contributes nothing; a rule
+whose whole access list contributes nothing is refused.
+.Pp
+Directives this backend cannot enforce are refused, never skipped:
+.Ic access net-tcp ,
+.Ic rule net-port ,
+.Ic scope ,
+a partial filesystem category such as
+.Ic access fs:read-file ,
+and the
+.Fl \-narrow
+option.
+.Ic abi-min
+and
+.Ic abi-max
+are Landlock preconditions and are read but have no effect here.
+On the Landlock backend the
+.Ic pledge
+directive is refused for the same reason.
+.Pp
+Consequences specific to this backend: executing a set-user-ID or
+set-group-ID binary fails with
+.Er EACCES
+instead of running without the elevation; a child that calls
+.Xr unveil 2
+itself receives
+.Er EPERM
+once the session's set is locked, and OpenBSD base utilities that treat
+that as fatal will exit; every directory component of a rule path must be
+readable by the account, so a search-only component refuses an
+unprivileged session; and the final
+component of a rule path is verified against symbolic links but re-resolved
+by name inside the kernel, so a rule whose parent directory is owned by the
+confined account keeps a one-system-call race that the Landlock backend
+does not have.
 .Ss Consequences to expect
 Landlock requires
 .Dv no_new_privs ,
@@ -2758,6 +2827,8 @@ Diagnostics for failed system calls append the error number in the form
 .\" .Xr profile 4 ,
 .Xr environ 7 ,
 .Xr landlock 7 ,
+.Xr pledge 2 ,
+.Xr unveil 2 ,
 .Xr setpriv 1 ,
 .Xr sysctl 8
 .Sh HISTORY

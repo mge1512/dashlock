@@ -10,18 +10,21 @@ Author: Matthias G. Eckermann
 ## 1. Summary
 
 `dashlock` is a fork of the Debian Almquist Shell (dash) that applies a
-Landlock policy to itself before it executes anything. The policy comes from a
-root-owned file selected by user name. Once applied, the restriction is
-inherited by every process the session starts and cannot be removed, including
-by root.
+kernel-enforced confinement policy to itself before it executes anything. On
+Linux the mechanism is Landlock; on OpenBSD it is unveil and pledge. The
+policy comes from a root-owned file selected by user name. Once applied, the
+restriction is inherited by every process the session starts and cannot be
+removed, including by root.
 
 The patch fires only when the binary is invoked under the name `dashlock`.
 Invoked as `dash`, `ash`, or `sh`, the same binary behaves exactly like
 upstream dash. The name check can be disabled at build time, which produces a
 binary that always confines itself regardless of the name it was called by.
 
-Target platform is SLES 16 / openSUSE Leap 16, and later. 
-The kernel floor is 6.12, which corresponds to Landlock ABI version 6.
+Primary target is SLES 16 / openSUSE Leap 16, and later; the kernel floor is
+6.12, which corresponds to Landlock ABI version 6. A second enforcement
+backend targets OpenBSD 7.9 and later, using unveil and pledge; section 7
+gives the reasoning and the rules that bind both backends.
 
 ## 2. Problem
 
@@ -353,7 +356,174 @@ worst they can do is restrict themselves further. That property is what lets a
 task runner select a per-invocation policy without the task runner becoming
 part of the trusted computing base.
 
-## 7. Sequencing
+## 7. Portability: an unveil and pledge backend
+
+dash descends from the NetBSD Almquist shell and builds on any POSIX system.
+A Linux-only security hook in a shell with that history is the first objection
+an upstream submission will meet, and the honest answer to it is a second
+enforcement backend rather than an argument. The systems were surveyed for a
+primitive with the same properties as Landlock: unprivileged, self-applied,
+inherited by children, irrevocable.
+
+| System | Primitive | Why it does not fit |
+| --- | --- | --- |
+| FreeBSD | Capsicum | capability mode removes the global namespace; after `cap_enter` a process cannot start arbitrary programs by path, and a shell must |
+| NetBSD | kauth(9), secmodel | administrator-side frameworks; no unprivileged self-confinement call, despite dash's ancestry |
+| macOS | `sandbox_init` | deprecated for a decade; the supported replacements are entitlement-based and not self-applied |
+| Windows | restricted tokens, AppContainer | a broker constructs the confined process; a process cannot reduce only its filesystem view for itself and its descendants |
+| OpenBSD | `unveil(2)`, `pledge(2)` | path-based filesystem restriction plus system-call-class restriction, both unprivileged and self-applied |
+
+OpenBSD is the match, and the design needs the two calls together. The
+reason is below; the manual pages do not state it.
+
+### 7.1 What the kernel does on execve
+
+The property this design depends on is what survives `execve`, and that is
+only visible in the kernel source. Verified in openbsd/src as of 2026-09
+(`sys/kern/kern_exec.c`, `sys_unveil` in `sys/kern/vfs_syscalls.c`,
+`sys_pledge` in `sys/kern/kern_pledge.c`, `sys/sys/proc.h`):
+
+- On `execve`, the unveil set and its lock survive only when execpromises are
+  in force (`PS_EXECPLEDGE`). Without them the kernel destroys the unveil
+  state; the comment in `kern_exec.c` reads "Clear our unveil paths out so the
+  child starts afresh". An unveil-only confinement therefore ends at the first
+  child. For this design, pledge is the inheritance vehicle and unveil is the
+  restriction.
+- `pledge(NULL, execpromises)` installs execpromises without restricting the
+  calling process. Every later `execve` starts the new image pledged with
+  exactly those promises, the flag is not cleared by `execve`, so
+  grandchildren inherit the same way. A descendant can drop promises and
+  cannot regain them; requests to raise are ignored or fail, and nothing
+  widens.
+- `unveil(NULL, NULL)` locks the set. Every later `unveil()` in that process
+  and in every fork or exec descendant returns plain `EPERM`. Fork copies the
+  set and the lock; under execpromises, `execve` keeps both.
+- An unlocked unveil set is not a confinement: the process can keep adding
+  paths anywhere it has any access. The lock is what turns a path list into a
+  boundary.
+- Executing a set-user-ID or set-group-ID binary under execpromises fails
+  with `EACCES`. Linux under `no_new_privs` runs such a binary without the
+  elevation; OpenBSD refuses the execution outright. Both fail closed; the
+  failure mode differs and the manual page states it.
+
+### 7.2 Three rules for every backend
+
+The build selects exactly one enforcement backend: Landlock where
+`linux/landlock.h` is present, unveil and pledge where those system calls
+are. The policy format is one grammar with one parser on every backend, and
+enforcement is bound by three rules:
+
+1. A restriction the backend cannot enforce is a refusal, never a skip. On
+   the unveil backend that covers the network category and net-port rules,
+   the scope directive, a partial filesystem category (the first unveil call
+   governs all four of its permission classes at once, so "handle reads
+   only" is not expressible), and the `--narrow` layer. On the Landlock
+   backend it covers the pledge directive.
+2. A precondition that does not apply to the backend is ignored. `abi-min`
+   and `abi-max` gate the Landlock version ladder; unveil has no ladder and
+   nothing to gate. Ignoring them loses nothing, because every feature they
+   would guard is covered by rule 1.
+3. Coarsening runs toward more denial, never less. The sixteen Landlock
+   rights map onto unveil's four permission classes; where the classes are
+   coarser, the backend denies more than the policy asked, not less. A right
+   the backend does not mediate by path (ioctl-dev on unveil) contributes
+   nothing to a rule, and a rule whose whole access list contributes nothing
+   is refused as an authoring mistake rather than silently accepted.
+
+### 7.3 The portable subset
+
+The subset of the policy grammar that works on every backend unchanged:
+
+```
+access   fs
+rule     path-beneath:ACCESS:PATH
+```
+
+with the class mapping, normative in the specification:
+
+| unveil class | Landlock rights it covers |
+| --- | --- |
+| r | read-file, read-dir |
+| w | write-file, truncate |
+| x | execute |
+| c | make-reg, make-dir, make-sock, make-fifo, make-char, make-block, make-sym, remove-file, remove-dir, refer |
+| (none) | ioctl-dev: not path-mediated by unveil; device ioctls fall under pledge promises |
+
+Everything outside the subset is backend-specific: `abi-min`, `abi-max`,
+`access fs:<subset>`, `access net-tcp`, `rule net-port` and `scope` belong to
+the Landlock backend; a `pledge` directive belongs to the unveil backend.
+
+The format deliberately gains no conditional syntax for this. No includes
+and no OS switches inside a policy file: the parser being small enough to
+review completely is a security property, and it outranks the convenience of
+one file for two systems. Policies are per-host files under per-host
+directories anyway; what the subset buys is that the allowlist body, the
+part that takes review effort, reads identically on both.
+
+### 7.4 What differs between the backends
+
+| Property | Landlock backend | unveil and pledge backend |
+| --- | --- | --- |
+| granularity | 16 filesystem rights | 4 classes r, w, x, c |
+| device ioctl | ioctl-dev per path | not path-mediated; pledge promise classes |
+| TCP | per-port bind and connect rules | not expressible; `inet` promise is all or nothing |
+| IPC scoping | abstract sockets and signals, ABI 6 | no equivalent; abstract socket namespace does not exist |
+| version gate | ABI ladder, abi-min and abi-max | none; the mechanism ships complete with the release |
+| symbolic links in rule paths | refused via handle-based resolution, no race | refused at verification; final component re-resolved by name, one-syscall race remains |
+| inherited descriptors | not revoked | not revoked |
+| set-ID binaries in session | run without elevation (`no_new_privs`) | execution refused with `EACCES` |
+| a child confining itself | adds an intersecting layer, up to 16 | `unveil()` returns `EPERM` after the lock; pledge reductions work |
+| AF_UNIX sockets by path | connect governed from ABI 9, outside current floor | `w` on the socket path governs connect |
+
+The child-self-confinement row has an operational consequence: OpenBSD base
+utilities routinely unveil themselves, treat a failing `unveil()` as fatal,
+and will exit under this backend. That is the fail-closed direction, it is
+visible and diagnosable, and the manual page documents it. The alternative,
+leaving the set unlocked so children can unveil, is not a confinement.
+
+### 7.5 The execpromises default
+
+Since execpromises must be installed for inheritance, their content is
+policy. The default is every promise this implementation knows, including
+"error", and a `pledge` directive in the policy replaces that default with
+the listed promises.
+
+The reasoning: the restriction of this design is the filesystem allowlist,
+and the Landlock backend restricts nothing else. Defaulting execpromises to
+the full set keeps the two backends semantically as close as the mechanisms
+allow; pledge then keeps the unveil set alive across `execve` and restricts
+little by itself. "error" is included because a promise violation in an
+arbitrary, never-pledge-aware child should produce an error return, which is
+what a Landlock denial produces, rather than a killed process.
+
+Version skew fails closed in both directions: an older kernel that does not
+know a name in the list rejects the whole `pledge` call and the session
+refuses; a newer kernel's new promise is absent from the list, so a child
+needing it is denied. The parallel to the wildcard-and-abi-max reasoning in
+section 6.6 is deliberate.
+
+### 7.6 Considered and rejected
+
+- Pledging the shell process itself. The shell needs a wide promise set, the
+  set would need maintenance with every dash change, and it restricts the one
+  process whose code we already control. Execpromises confine the processes
+  that need it: everything the session starts.
+- Emulating the network category by withholding `inet` and `dns` from
+  execpromises. That denies all of TCP, UDP and name resolution to enforce a
+  policy that asked for one closed port; the distance between what was
+  written and what happens is too large for a security tool. Refusal is
+  honest, per rule 1.
+- Treating `scope abstract-unix-socket` as satisfied on OpenBSD because the
+  abstract namespace does not exist there. True but unenforced: the
+  specification would then claim an enforcement the code never performs, and
+  the `signal` half of the same directive has no equivalent at all. Refusal,
+  per rule 1.
+- A userspace intersection of two unveil sets to support `--narrow`.
+  Computable for directory prefixes, subtle for name-based entries, and
+  exactly the kind of security-relevant complexity the kernel does for free
+  on Linux. Deferred until something needs it.
+
+## 8. Sequencing
 
 | Phase | Deliverable | Where |
 | --- | --- | --- |
@@ -380,14 +550,14 @@ review, and the specification records the resulting change log. The findings
 that became code fixes are recorded there. The ones that remain deployment
 preconditions, a trusted launcher, a sanitized loader environment,
 unprivileged user namespaces disabled, and no file capabilities on the binary,
-are in section 8 and in the manual page, because self-confinement in a
+are in section 9 and in the manual page, because self-confinement in a
 dynamically linked binary cannot close them from inside.
 
 Packaging follows the usual route: signed packages built in the Open Build
 Service, with the policy files in a separate package so that a policy change
 does not require a shell rebuild.
 
-## 8. Limits
+## 9. Limits
 
 What this design does not do, in each case for a structural reason rather
 than a missing feature.
@@ -429,7 +599,27 @@ than a missing feature.
   narrowing layer changes filesystem link and rename behavior. Policies that
   need cross-hierarchy rename must grant `refer` explicitly.
 
-## 9. Open questions
+Limits specific to the unveil and pledge backend:
+
+- The backend verifies every rule path component by component on directory
+  handles and refuses symbolic links, but OpenBSD has no handle-based
+  `unveil()`, so the final component is re-resolved by name inside the
+  system call. A rule whose parent directory is owned by the confined
+  account keeps a one-syscall race that the Linux backend does not have.
+  Rule paths whose parents are root-owned do not.
+- The rule-path verification opens each directory component for reading. A
+  component the session cannot read is refused; for an unprivileged
+  account that includes search-only (`--x`) directories. The Landlock
+  backend, which opens with `O_PATH`, accepts them.
+- Once the session's unveil set is locked, a child's own `unveil()` call
+  returns `EPERM`. OpenBSD base utilities that unveil themselves and treat
+  the failure as fatal will exit. This is the fail-closed direction; the
+  manual page documents it.
+- No `--narrow` layer, no network category, no scoping, no partial
+  filesystem category: rule 1 of section 7.2 refuses each of them rather
+  than approximating.
+
+## 10. Open questions
 
 1. Does the policy for the agent account belong in the `dashlock` package, in a
    separate policy package, or in a configuration management layer? A separate
@@ -448,10 +638,14 @@ than a missing feature.
 5. Does anything else we ship want the same treatment? The pattern generalizes
    to any process that reads untrusted instructions and then runs commands.
 
-## 10. References
+## 11. References
 
 - Landlock user-space documentation: `Documentation/userspace-api/landlock.rst`
   in the kernel tree, and `landlock(7)`
+- `unveil(2)` and `pledge(2)`, OpenBSD manual pages; the execve coupling in
+  section 7.1 is from the kernel source: `sys/kern/kern_exec.c`,
+  `sys/kern/vfs_syscalls.c`, `sys/kern/kern_pledge.c` in openbsd/src,
+  reviewed 2026-09
 - `setpriv(1)`, util-linux 2.40 and later, for the access right vocabulary
 - Trail of Bits, "VMs won't contain cyber-capable agents", 2026-08-26
 - dash upstream: Herbert Xu, current release 0.5.13.5

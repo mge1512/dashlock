@@ -4,7 +4,7 @@
 
 Deployment:   enhance-existing
 Language:     any
-Version:      0.5.0
+Version:      0.6.0
 Spec-Schema:  0.4.0
 Hints-file:   dashlock.c.hints.md
 Author:       Matthias G. Eckermann
@@ -15,25 +15,30 @@ Safety-Level: QM
 ---
 
 This specification is written in PCD form but is not intended to be executed as
-a full PCD translation. It is language-agnostic; the C-on-Linux realisation,
-including system-call numbers, structure layouts, header handling, and the
-build options, is in the accompanying hints file
+a full PCD translation. It is language-agnostic; the platform realizations,
+C on Linux and C on OpenBSD, including system-call numbers, structure layouts,
+header handling, and the build options, are in the accompanying hints file
 `dashlock.c.hints.md`. The existing implementation is dash 0.5.13.5 by Herbert
 Xu, a long-established C codebase that is not going to be regenerated from a
 specification. What the PCD form buys here is the discipline: every rule that
 decides whether a session is confined is written down once, in a place where it
 can be reviewed and diffed, instead of being distributed across a patch.
 
-The result is a fork named `dashlock`. It applies a Landlock policy to itself
-before it reads any profile file, any rc file, or any command, and the
-restriction is then inherited by every process the session starts and cannot be
-removed by any privilege level.
+The result is a fork named `dashlock`. It applies a kernel-enforced
+confinement policy to itself before it reads any profile file, any rc file,
+or any command, and the restriction is then inherited by every process the
+session starts and cannot be removed by any privilege level. The enforcement
+backend is selected at build time: Landlock on Linux, unveil and pledge on
+OpenBSD. One grammar and one parser serve both; the backend contract in
+enforce-policy states what each backend must refuse.
 
 The addition is inert unless the binary is invoked under the name `dashlock`.
 Invoked as `dash`, `ash`, or `sh`, the binary behaves exactly like upstream
 dash: no new file is opened, no system call is made, no error path is reachable.
 
-Target platform is SLE 16 and later, kernel 6.12, Landlock ABI version 6.
+Target platforms are SLE 16 and later (kernel 6.12, Landlock ABI version 6)
+and OpenBSD 7.9 and later (unveil and pledge, verified against the kernel
+source as of 2026-09).
 
 ## TYPES
 
@@ -73,6 +78,33 @@ NetAccessName := "bind-tcp" | "connect-tcp"
 ScopeName := "abstract-unix-socket" | "signal"
   // IPC scoping names, available from Landlock ABI version 6.
 
+PortableClass := "r" | "w" | "x" | "c"
+  // The unveil permission classes. The mapping from FsAccessName values is
+  // normative and one-directional: it may deny more than the named rights,
+  // never less.
+  //
+  //   r  <- read-file, read-dir
+  //   w  <- write-file, truncate
+  //   x  <- execute
+  //   c  <- make-reg, make-dir, make-sock, make-fifo, make-char,
+  //         make-block, make-sym, remove-file, remove-dir, refer
+  //
+  // ioctl-dev maps to no class: unveil does not mediate device ioctl by
+  // path, so the name contributes nothing on that backend. A rule whose
+  // whole access set maps to nothing is refused by enforce-policy-unveil.
+
+PledgeName := "audio" | "bpf" | "chown" | "cpath" | "disklabel" | "dns"
+            | "dpath" | "drm" | "error" | "exec" | "fattr" | "flock"
+            | "getpw" | "id" | "inet" | "mcast" | "pf" | "proc"
+            | "prot_exec" | "ps" | "recvfd" | "route" | "rpath" | "sendfd"
+            | "settime" | "stdio" | "tape" | "tty" | "unix" | "unveil"
+            | "video" | "vminfo" | "vmm" | "wpath" | "wroute"
+  // OpenBSD pledge promise names known to this implementation, the state of
+  // OpenBSD 7.9 and -current as of 2026-09. Every backend validates pledge
+  // directives against this list at parse time; only the unveil backend
+  // enforces them, per the enforce-policy contract. "tmppath" was removed
+  // from OpenBSD and is deliberately absent.
+
 FsAccessSet := set of FsAccessName where non-empty
 NetAccessSet := set of NetAccessName where non-empty
 ScopeSet := set of ScopeName
@@ -97,8 +129,18 @@ Policy := {
   pathRules:  PathRule[],
   netRules:   NetRule[],
   abiFloor:   AbiVersion,
-  abiCeiling: AbiVersion | none
+  abiCeiling: AbiVersion | none,
+  pledged:    set of PledgeName | none
 }
+  // pledged is none when the policy contains no pledge directive; the unveil
+  // backend then installs every PledgeName this implementation knows. An
+  // empty set is not constructible: a pledge directive with no names is
+  // refused at parse time.
+  //
+  // abiFloor and abiCeiling are precondition values for the landlock
+  // backend; the unveil backend records and ignores them, per the
+  // enforce-policy contract.
+  //
   // abiFloor is the explicit floor from an abi-min directive, defaulting to 1.
   // The effective requirement is computed by compute-required-abi and is
   // always at least as high as abiFloor.
@@ -205,11 +247,15 @@ STEPS:
 2. If argv[2] is NULL → refuse with reason "--narrow requires an argument".
 3. If argv[2] does not match the NarrowName pattern → refuse with reason
    "invalid narrow policy name".
-4. Record argv[2] as the requested NarrowName.
-5. Remove argv[1] and argv[2] from the argument vector by moving every
+4. If the build's enforcement backend has no narrowing layer → refuse with
+   reason "narrowing is not supported by this backend". The refusal comes
+   before any policy file is read, so the administrator sees the actual
+   limitation instead of a missing-file message.
+5. Record argv[2] as the requested NarrowName.
+6. Remove argv[1] and argv[2] from the argument vector by moving every
    following element two positions towards the front, including the
    terminating NULL.
-6. Return.
+7. Return.
 
 POSTCONDITIONS:
 - The shell never observes the "--narrow" token or its argument
@@ -222,6 +268,8 @@ ERRORS:
 - Refusal "--narrow requires an argument" when the value is missing
 - Refusal "invalid narrow policy name" when the value contains anything outside
   [A-Za-z0-9_-]
+- Refusal "narrowing is not supported by this backend" when the enforcement
+  backend has no narrowing layer
 
 ## BEHAVIOR/INTERNAL: resolve-user-key
 
@@ -468,23 +516,31 @@ STEPS:
 7. If the keyword is "scope": add each name in the comma-separated remainder to
    scoped; on an unknown name → refuse with reason "unknown scope name <name>
    in <source>".
-8. For any other keyword → refuse with reason "unknown directive <keyword> in
+8. If the keyword is "pledge": split the rest at whitespace into promise
+   names. An empty list → refuse with reason "pledge without promises in
+   <source>". Any name outside PledgeName → refuse with reason "unknown
+   promise name <name> in <source>". Add the names to pledged; with several
+   pledge lines the union is taken. The validation runs on every backend, so
+   a typo is caught on the machine where the policy was written, not only on
+   the one where it is enforced. A pledge directive does not make a policy
+   handle access; the check in step 10 is unchanged.
+9. For any other keyword → refuse with reason "unknown directive <keyword> in
    <source>".
-9. After all lines: if handledFs and handledNet are both empty, scoped is
-   empty, and neither wildcard category was requested → refuse with reason
-   "<source> handles no access". If abiCeiling is set and is below abiFloor →
-   refuse with reason "abi-max below abi-min in <source>".
-10. Unless the filesystem wildcard category was requested: for every PathRule
+10. After all lines: if handledFs and handledNet are both empty, scoped is
+    empty, and neither wildcard category was requested → refuse with reason
+    "<source> handles no access". If abiCeiling is set and is below abiFloor →
+    refuse with reason "abi-max below abi-min in <source>".
+11. Unless the filesystem wildcard category was requested: for every PathRule
     whose access set is not contained in handledFs → refuse with reason
     "rule for <path> uses access not handled in <source>". A rule granting an
     unhandled right would otherwise reach the kernel and fail there with a
     bare invalid-argument error; refusing here names the actual mistake. With
     the wildcard in force every parseable right is handled, and kernel
     support is guaranteed separately by compute-required-abi.
-11. Unless the network wildcard category was requested: for every NetRule
+12. Unless the network wildcard category was requested: for every NetRule
     whose access set is not contained in handledNet → refuse with reason
     "rule for port <port> uses access not handled in <source>".
-12. Return the Policy.
+13. Return the Policy.
 
 The wildcard categories "access fs" and "access net-tcp" are recorded as
 requests and expanded against the running kernel only at enforcement time.
@@ -508,6 +564,8 @@ ERRORS:
 - Refusal "abi-max below abi-min in <source>"
 - Refusal "unknown access name <name> in <source>"
 - Refusal "unknown scope name <name> in <source>"
+- Refusal "pledge without promises in <source>"
+- Refusal "unknown promise name <name> in <source>"
 - Refusal "unknown rule type <type> in <source>"
 - Refusal "unknown directive <keyword> in <source>"
 - Refusal "malformed rule in <source>"
@@ -520,10 +578,12 @@ ERRORS:
 
 ## BEHAVIOR/INTERNAL: compute-required-abi
 
-Constraint: required
+Constraint: required (landlock backend)
 
 Derives the Landlock ABI version a Policy needs, so that a policy is never
-applied with parts of it silently dropped.
+applied with parts of it silently dropped. Only the landlock backend calls
+this; unveil has no version ladder, and every feature the ladder would gate
+is refused there by the enforce-policy contract.
 
 MECHANISM: the requirement is derived from the directives the file uses, and
 the explicit abi-min directive can only raise it. Deriving it means an
@@ -564,7 +624,31 @@ ERRORS:
 Constraint: required
 
 Applies the policy to the calling process. After this returns, the shell
-continues its normal startup and every process it starts inherits the domain.
+continues its normal startup and every process the session starts inherits
+the restriction.
+
+MECHANISM: the build selects exactly one enforcement backend at configure
+time: landlock where the Linux Landlock interface is available, unveil where
+the OpenBSD unveil and pledge system calls are. One policy grammar and one
+parser serve every backend; what differs is enforcement, and it is bound by
+three rules. First, a restriction directive the backend cannot enforce is a
+refusal, never a skip. Second, a precondition directive that does not apply
+to the backend is ignored; abi-min and abi-max gate the Landlock version
+ladder and gate nothing elsewhere, and every feature they would guard on the
+Landlock backend is already covered by the first rule. Third, access mapping
+may coarsen toward more denial, never toward less.
+
+Directive applicability, normative for every backend:
+
+| Directive | landlock backend | unveil backend |
+| --- | --- | --- |
+| `abi-min`, `abi-max` | version gate | ignored, nothing to gate |
+| `access fs` (wildcard) | enforced | enforced |
+| `access fs:<subset>` | enforced | refused: unveil governs all four classes at once |
+| `access net-tcp`, `rule net-port` | enforced | refused |
+| `rule path-beneath` | enforced per right | enforced per PortableClass mapping |
+| `scope` | enforced | refused |
+| `pledge` | refused | enforced |
 
 INPUTS:
 ```
@@ -575,51 +659,83 @@ narrow: Policy | absent   // the narrowing policy, when --narrow was given
 PRECONDITIONS:
 - Both policies came from parse-policy
 - No profile file, rc file, or command has been read or parsed yet
+- On the unveil backend, narrow is always absent: consume-narrow-argument
+  refused any narrowing request before a policy was read
 
 STEPS:
-1. Query the running Landlock ABI version from the kernel. On failure → refuse
-   with reason "landlock unavailable: enable it in CONFIG_LSM or the lsm= boot
-   parameter".
-2. If base has an abiCeiling and the running version exceeds it → refuse with
-   reason "kernel landlock ABI <m> exceeds policy abi-max <n>". Repeat for
-   narrow when present.
-3. Call compute-required-abi for base; if the running version is lower →
-   refuse with reason "policy needs landlock ABI <n>, kernel provides <m>".
-4. If narrow is present, repeat step 3 for it.
-4. Set PR_SET_NO_NEW_PRIVS to 1. On failure → refuse with reason "cannot set
-   no_new_privs".
-5. Apply base: create a ruleset whose handled access is the policy's handled
-   sets masked to the rights the running ABI supports, and whose attribute
-   size matches the running ABI. On failure → refuse with reason "cannot create
-   ruleset".
-6. For every PathRule: open the path as a resolvable handle without following
-   any symbolic-link component, since a root-authored policy commonly names a
-   path whose leaf the confined account controls, and a symbolic link there
-   would attach the rule to a different hierarchy than the administrator
-   named. On failure, including refusal of a symbolic-link component → refuse
-   with reason "cannot open rule path <path>". Add a path-beneath rule for the
-   opened handle and release it. On failure → refuse with reason "cannot add
-   rule for <path>".
-7. For every NetRule: add a net-port rule. On failure → refuse with reason
-   "cannot add rule for port <port>".
-8. Call landlock_restrict_self on the ruleset and close it. On failure →
-   refuse with reason "cannot apply policy".
-9. If narrow is present, repeat steps 5 to 8 for it, which adds a second layer.
-10. Return; the shell continues its normal startup.
+1. On the landlock backend, run enforce-policy-landlock for base and narrow.
+2. On the unveil backend, run enforce-policy-unveil for base.
+3. Return; the shell continues its normal startup.
 
 POSTCONDITIONS:
-- The domain is applied before /etc/profile, $HOME/.profile, $ENV, and any -c
-  argument are read
-- Every process the session starts inherits the domain
-- The domain cannot be removed or relaxed afterwards by any privilege level
-- With a narrowing policy present, the second layer can only remove access,
-  because the kernel intersects layers
-- There is no partial application: any failure between step 4 and step 9 exits
-  rather than continuing with a weaker domain than the policy describes
+- The restriction is applied before /etc/profile, $HOME/.profile, $ENV, and
+  any -c argument are read
+- Every process the session starts inherits the restriction
+- The restriction cannot be removed or relaxed afterwards by any privilege
+  level
+- There is no partial application: any failure inside the selected backend
+  exits rather than continuing with a weaker restriction than the policy
+  describes
 - There is no best-effort mode; a policy the running kernel cannot enforce as
   written is refused
 
 ERRORS:
+- Every refusal produced by the selected backend behavior
+
+## BEHAVIOR/INTERNAL: enforce-policy-landlock
+
+Constraint: required (landlock backend)
+
+Applies the policy with the Linux Landlock interface.
+
+INPUTS:
+```
+base:   Policy            // the user policy
+narrow: Policy | absent   // the narrowing policy, when --narrow was given
+```
+
+PRECONDITIONS:
+- The build selected the landlock backend
+
+STEPS:
+1. If base records a pledge directive, or narrow does → refuse with reason
+   "backend cannot enforce pledge in <source>".
+2. Query the running Landlock ABI version from the kernel. On failure →
+   refuse with reason "landlock unavailable: enable it in CONFIG_LSM or the
+   lsm= boot parameter".
+3. If base has an abiCeiling and the running version exceeds it → refuse
+   with reason "kernel landlock ABI <m> exceeds policy abi-max <n>". Repeat
+   for narrow when present.
+4. Call compute-required-abi for base; if the running version is lower →
+   refuse with reason "policy needs landlock ABI <n>, kernel provides <m>".
+   If narrow is present, repeat for it.
+5. Set PR_SET_NO_NEW_PRIVS to 1. On failure → refuse with reason "cannot set
+   no_new_privs".
+6. Apply base: create a ruleset whose handled access is the policy's handled
+   sets masked to the rights the running ABI supports, and whose attribute
+   size matches the running ABI. On failure → refuse with reason "cannot
+   create ruleset".
+7. For every PathRule: open the path as a resolvable handle without following
+   any symbolic-link component, since a root-authored policy commonly names a
+   path whose leaf the confined account controls, and a symbolic link there
+   would attach the rule to a different hierarchy than the administrator
+   named. On failure, including refusal of a symbolic-link component →
+   refuse with reason "cannot open rule path <path>". Add a path-beneath rule
+   for the opened handle and release it. On failure → refuse with reason
+   "cannot add rule for <path>".
+8. For every NetRule: add a net-port rule. On failure → refuse with reason
+   "cannot add rule for port <port>".
+9. Call landlock_restrict_self on the ruleset and close it. On failure →
+   refuse with reason "cannot apply policy".
+10. If narrow is present, repeat steps 6 to 9 for it, which adds a second
+    layer.
+
+POSTCONDITIONS:
+- With a narrowing policy present, the second layer can only remove access,
+  because the kernel intersects layers
+
+ERRORS:
+- Refusal "backend cannot enforce pledge in <source>"
 - Refusal "landlock unavailable: enable it in CONFIG_LSM or the lsm= boot parameter"
 - Refusal "kernel landlock ABI <m> exceeds policy abi-max <n>"
 - Refusal "policy needs landlock ABI <n>, kernel provides <m>"
@@ -629,6 +745,94 @@ ERRORS:
 - Refusal "cannot add rule for <path>"
 - Refusal "cannot add rule for port <port>"
 - Refusal "cannot apply policy"
+
+## BEHAVIOR/INTERNAL: enforce-policy-unveil
+
+Constraint: required (unveil backend)
+
+Applies the policy with the OpenBSD unveil and pledge system calls. The
+kernel keeps the unveil set across execve only while execution promises are
+in force, so the sequence installs both and the order below is normative.
+
+MECHANISM: after the first unveil call the calling process's own filesystem
+view is already restricted, while the unveil system call itself resolves
+paths unrestricted. Every rule path is therefore verified first, on open
+directory handles, before the first unveil call; the handles pin the
+verified ancestors so that no component can be substituted between
+verification and use. OpenBSD has no handle-based unveil, so the final
+component is passed by name relative to its verified parent directory and
+re-resolved inside the system call; verification refuses a symbolic link
+there, and the residual one-system-call race is documented in the design and
+the manual page.
+
+INPUTS:
+```
+base: Policy   // the user policy
+```
+
+PRECONDITIONS:
+- The build selected the unveil backend
+- No narrowing policy was requested; consume-narrow-argument refused it
+  otherwise
+
+STEPS:
+1. If base handles the network category or contains a NetRule → refuse with
+   reason "backend cannot enforce access net-tcp in <source>" or "backend
+   cannot enforce rule net-port in <source>".
+2. If base scopes anything → refuse with reason "backend cannot enforce
+   scope in <source>".
+3. If base handles a filesystem subset rather than the wildcard → refuse
+   with reason "backend cannot enforce access fs:<name> in <source>",
+   where <name> is the first subset right. The first unveil call governs
+   all four permission classes at once; a partial category is not expressible.
+4. For every PathRule, map its FsAccessSet to a set of PortableClass values
+   per the TYPES mapping. If the mapped set is empty → refuse with reason
+   "rule for <path> grants nothing this backend mediates".
+5. Save a handle to the current working directory. On failure → refuse with
+   reason "cannot save working directory".
+6. For every PathRule, before any unveil call: resolve the rule path from
+   the root, one component at a time, on open directory handles, refusing
+   any symbolic-link component; verify that the final component exists and
+   is not a symbolic link; keep the handle of the verified parent directory.
+   On any failure → refuse with reason "cannot open rule path <path>". A
+   rule naming the root directory itself has no parent: it needs no walk,
+   the root cannot be a symbolic link, and step 7 applies it as an unveil
+   of "/" without a directory change.
+7. For every PathRule, in policy order: change directory to the verified
+   parent handle, issue the unveil call for the final component with the
+   mapped classes. On failure → refuse with reason "cannot unveil <path>".
+8. Lock the unveil set. On failure → refuse with reason "cannot lock
+   unveil".
+9. Install the execution promises: the set from the policy's pledge
+   directives, or, when the policy has none, every PledgeName this
+   implementation knows. On failure, including a promise name the running
+   kernel does not accept → refuse with reason "cannot set execution
+   promises".
+10. Restore the saved working directory and release the handles. On failure
+    → refuse with reason "cannot restore working directory".
+
+POSTCONDITIONS:
+- The unveil set is locked and the execution promises are installed before
+  any profile file, rc file, or command is read
+- Every execve in the session starts the new image with the execution
+  promises, which is the condition under which the kernel preserves the
+  unveil set and its lock
+- A descendant's own unveil call fails cleanly rather than widening the set
+- The working directory of the shell is the same as before enforcement
+- No unveil call is issued before every rule path has been verified
+
+ERRORS:
+- Refusal "backend cannot enforce access net-tcp in <source>"
+- Refusal "backend cannot enforce rule net-port in <source>"
+- Refusal "backend cannot enforce scope in <source>"
+- Refusal "backend cannot enforce access fs:<name> in <source>"
+- Refusal "rule for <path> grants nothing this backend mediates"
+- Refusal "cannot save working directory"
+- Refusal "cannot open rule path <path>"
+- Refusal "cannot unveil <path>"
+- Refusal "cannot lock unveil"
+- Refusal "cannot set execution promises"
+- Refusal "cannot restore working directory"
 
 ## BEHAVIOR: refuse
 
@@ -685,9 +889,11 @@ Launch conditions, all the responsibility of whatever invokes the shell:
 - Either the invocation name is truthful, or the build has the name gate
   disabled. Where the confined party can choose the name it invokes, only the
   no-gate build is a boundary.
-- The user and mount namespaces are those of the trusted host. Ownership by
-  user ID 0 is a namespace-relative fact, so a party able to create its own
-  user namespace can present its own policy as root-owned.
+- On Linux, the user and mount namespaces are those of the trusted host.
+  Ownership by user ID 0 is a namespace-relative fact there, so a party able
+  to create its own user namespace can present its own policy as root-owned.
+  OpenBSD has no unprivileged equivalent, so on the unveil backend this
+  condition holds by construction.
 - The process starts single-threaded, since a sibling thread created before
   the domain is applied does not inherit it.
 - The set of inherited descriptors is known and intended. A descriptor opened
@@ -702,8 +908,14 @@ Launch conditions, all the responsibility of whatever invokes the shell:
 Environment conditions:
 
 - The existing dash 0.5.13.5 source tree is present and builds.
-- The kernel provides Landlock at ABI version 6 or higher, which means 6.12 or
-  later, and landlock appears in CONFIG_LSM or in the lsm= boot parameter.
+- On the landlock backend: the kernel provides Landlock at ABI version 6 or
+  higher, which means 6.12 or later, and landlock appears in CONFIG_LSM or in
+  the lsm= boot parameter.
+- On the unveil backend: the system is OpenBSD 7.9 or later. The behaviors in
+  this specification rely on kernel semantics verified against the kernel
+  source as of 2026-09, in particular that the unveil set and its lock
+  survive execve exactly when execution promises are in force; earlier
+  releases have not been evaluated.
 - Policy files and their directory chains are owned by root and not writable by
   group or other.
 - The binary is not set-user-ID and not set-group-ID.
@@ -719,7 +931,7 @@ Environment conditions:
 
 ## INVARIANTS
 
-- [observable]  Invoked as dash, ash, or sh, the binary opens no policy file and issues no landlock system call
+- [observable]  Invoked as dash, ash, or sh, the binary opens no policy file and issues no confinement system call
 - [observable]  Invoked as dashlock with no readable policy, the process exits 78 and executes no command
 - [observable]  Every refusal exits with status 78 and writes one line beginning "dashlock: " to file descriptor 2
 - [observable]  Every refusal writes nothing to standard output
@@ -727,26 +939,32 @@ Environment conditions:
 - [observable]  A --narrow token in any argument position other than the first reaches the shell unchanged
 - [observable]  A policy file that is not owned by root, or whose directory chain is writable by non-root, is refused
 - [observable]  A policy containing an unknown directive is refused rather than partially applied
-- [observable]  A policy that uses scoping is refused on a kernel below ABI 6
-- [observable]  A policy stating the network wildcard category is refused on a kernel below ABI 4, never applied with the network portion silently dropped
+- [observable]  On the landlock backend, a policy that uses scoping is refused on a kernel below ABI 6
+- [observable]  On the landlock backend, a policy stating the network wildcard category is refused on a kernel below ABI 4, never applied with the network portion silently dropped
 - [observable]  A rule requesting bind on an ephemeral port (port 0) is accepted; port 0 with connect is refused
 - [implementation]  No code path exists that applies a subset of a policy and continues
 - [implementation]  No environment variable influences whether or how the policy is applied
 - [implementation]  All policy paths are built from a configured directory plus a validated key, never from the environment or the command line
 - [implementation]  Every component of a policy path, from the root to the file, is checked on an open handle, never on its name
 - [implementation]  No component of a policy path is ever a symbolic link, and a symbolic link anywhere in the chain is refused even when its target would pass
-- [implementation]  A rule path is opened without following any symbolic-link component
+- [implementation]  No symbolic-link component of a rule path is ever accepted: the landlock backend resolves and uses the verified handle itself; the unveil backend verifies on directory handles and refuses a symbolic-link final component before the name is passed to the kernel
 - [implementation]  Every failed system call's error status is captured before any cleanup call that could overwrite it
 - [observable]  A refusal caused by a bad ancestor directory names that directory, not the full policy-file path
 - [observable]  A refusal always exits 78 and never terminates by signal, even when the standard error descriptor is closed
 - [observable]  Only a definitive no-entry name-service result keys a session by numeric ID; any lookup error refuses
 - [implementation]  Diagnostics are written directly to the standard error file descriptor, never through the shell output layer, which is not initialised yet
-- [implementation]  The narrowing layer can only intersect, so a caller that controls the command line cannot widen the user policy
+- [implementation]  A narrowing layer can only intersect (landlock backend) or is refused outright (unveil backend); a caller that controls the command line can never widen the user policy
 - [observable]  A set-user-ID or set-group-ID invocation is refused before any policy file is read
 - [observable]  No user-triggerable name service failure selects a different policy file; such failures refuse the session
 - [observable]  In a build without the name gate, no form of argument vector produces an unconfined session
 - [observable]  A policy file containing a NUL byte is refused
 - [observable]  A rule granting an access right its policy does not handle is refused at parse time
+- [observable]  A pledge directive naming an unknown promise is refused at parse time on every backend
+- [observable]  On the landlock backend, a policy containing a pledge directive is refused
+- [observable]  On the unveil backend, a policy stating a network category, a network rule, a scope directive, or a partial filesystem category is refused; nothing is silently dropped
+- [observable]  On the unveil backend, a --narrow request is refused before any policy file is read
+- [observable]  On the unveil backend, the unveil set is locked and the execution promises are installed before any profile file, rc file, or command is read
+- [implementation]  On the unveil backend, no unveil call is issued before every rule path has been verified on open directory handles
 
 ## EXAMPLES
 
@@ -967,13 +1185,68 @@ THEN:
   exit code is 78
   the mistake is named at parse time instead of failing in the kernel
 
+### EXAMPLE: unveil_backend_confined_session
+GIVEN:
+  a build with the unveil backend on OpenBSD
+  /etc/dashlock/users/agent contains:
+    access fs
+    rule path-beneath:execute,read-file,read-dir:/usr
+    rule path-beneath:execute,read-file,read-dir:/bin
+    rule path-beneath:read-file,read-dir:/etc
+    rule path-beneath:read-file,write-file,read-dir,make-reg,make-dir,remove-file,remove-dir,refer,truncate:/tmp
+WHEN:
+  enforce-policy-unveil runs for that policy
+THEN:
+  every rule path is verified on directory handles before the first unveil call
+  /usr and /bin are unveiled with classes rx, /etc with r, /tmp with rwc
+  the unveil set is locked and the execution promises are installed
+  the shell continues startup and reads /etc/profile
+  a later "cat /etc/hosts" succeeds
+  a later "cat /root/.ssh/id_ed25519" fails, the path is outside the set
+  a later child that calls unveil() itself receives EPERM and cannot widen the set
+
+### EXAMPLE: scope_refused_on_unveil_backend
+GIVEN:
+  a build with the unveil backend
+  a policy containing "scope abstract-unix-socket,signal"
+WHEN:
+  enforce-policy-unveil checks the directives against the backend contract
+THEN:
+  refuse is called with reason "backend cannot enforce scope in /etc/dashlock/users/agent"
+  exit code is 78
+  the policy is not applied with the scoping silently dropped
+
+### EXAMPLE: narrow_refused_on_unveil_backend
+GIVEN:
+  a build with the unveil backend
+  the binary is invoked as: dashlock --narrow readonly -c true
+WHEN:
+  consume-narrow-argument records the narrowing request
+THEN:
+  refuse is called with reason "narrowing is not supported by this backend"
+  exit code is 78
+  no policy file is read
+
+### EXAMPLE: pledge_refused_on_landlock_backend
+GIVEN:
+  a build with the landlock backend
+  a valid policy with one extra line: "pledge stdio rpath exec"
+WHEN:
+  enforce-policy-landlock checks the directives against the backend contract
+THEN:
+  refuse is called with reason "backend cannot enforce pledge in /etc/dashlock/users/agent"
+  exit code is 78
+  the directive is not silently ignored
+
 ## DEPENDENCIES
 
-No new external library. The addition uses the platform standard library and
-the Landlock system calls landlock_create_ruleset, landlock_add_rule, and
-landlock_restrict_self, plus a path-open call able to reject symbolic-link
-components. Fixed system-call numbers, structure layouts, and platform-specific
-constants belong in the language hints file, not here.
+No new external library. The addition uses the platform standard library
+plus, per backend, the confinement system calls: landlock_create_ruleset,
+landlock_add_rule, and landlock_restrict_self on Linux, together with a
+path-open call able to reject symbolic-link components; unveil and pledge on
+OpenBSD, together with directory-handle opens, fstatat, and fchdir for the
+rule-path verification. Fixed system-call numbers, structure layouts, and
+platform-specific constants belong in the language hints file, not here.
 
 Linux uapi header linux/landlock.h:
   minimum-version: any
@@ -988,11 +1261,13 @@ helper library.
 
 ## DELIVERABLES
 
-COMPONENT: landlock-integration
-  purpose: Implements every BEHAVIOR in this specification
+COMPONENT: confinement-integration
+  purpose: Implements every BEHAVIOR in this specification, for the backend
+           selected at build time
   required: true
   note: One new source file and one new header, so that the change to the
-        existing shell entry point stays at two lines. Target files
+        existing shell entry point stays at two lines. Common code is shared;
+        each backend sits in its own clearly delimited section. Target files
         src/dashlock.c and src/dashlock.h.
 
 COMPONENT: shell-entry-hook
@@ -1002,15 +1277,24 @@ COMPONENT: shell-entry-hook
   note: Two lines: one include, one call. Target file src/main.c.
 
 COMPONENT: build-integration
-  purpose: Configure options, feature detection, and the new source file in the
-           build
+  purpose: Configure options, backend detection, and the new source file in
+           the build
   required: true
-  note: Target files configure.ac and src/Makefile.am.
+  note: The backend is auto-selected: landlock where linux/landlock.h is
+        present, unveil where the unveil and pledge system calls are, an
+        error under --enable-dashlock where neither is. No configure option
+        selects a backend by hand; a build that silently produced the wrong
+        backend would be a policy decision nobody made. Target files
+        configure.ac and src/Makefile.am.
 
 COMPONENT: policy-examples
   purpose: A vendor default policy and a narrowing example, installed under the
            vendor directory
   required: true
+  note: The default policy is backend-specific and the build installs the
+        variant matching its backend under the name "default". The narrowing
+        example is installed on the landlock backend only; the unveil backend
+        refuses --narrow.
 
 COMPONENT: documentation
   purpose: A manual page section describing the trigger name, the lookup order,
@@ -1032,7 +1316,7 @@ Build-time options:
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--disable-dashlock` | enabled where linux/landlock.h is present | remove the addition entirely |
+| `--disable-dashlock` | enabled where a backend is detected | remove the addition entirely |
 | `--disable-dashlock-name-gate` | gate enabled | always confine, whatever the invocation name |
 | `--with-dashlock-name=NAME` | `dashlock` | trigger name |
 | `--with-dashlock-etcdir=DIR` | `/etc/dashlock` | administrator policy directory |
@@ -1044,6 +1328,30 @@ Whether the gate applies is a property of the binary, not of its runtime
 environment.
 
 ## DELTA
+
+Version 0.6.0 adds a second enforcement backend, unveil and pledge on
+OpenBSD, without changing the grammar's parser model: one grammar, one
+parser, every directive validated on every backend. enforce-policy is now a
+backend contract with two internal realizations, enforce-policy-landlock
+(the previous steps, unchanged in substance) and enforce-policy-unveil (new).
+The contract states three rules: a restriction a backend cannot enforce is a
+refusal, a precondition that does not apply is ignored, and access mapping
+may only coarsen toward more denial. New in the grammar: the pledge
+directive, whose promise names are validated at parse time everywhere and
+enforced on the unveil backend as execution promises. The default execution
+promises are every promise the implementation knows, because on OpenBSD the
+promises are what the kernel requires for the unveil set to survive execve,
+verified
+in the kernel source rather than taken from the manual pages, and the
+restriction of this design remains the filesystem allowlist. The unveil
+backend refuses the network category, net-port rules, scope, partial
+filesystem categories, and --narrow; consume-narrow-argument refuses a
+narrowing request before any policy file is read. Rule paths are verified on
+open directory handles before the first unveil call, since the calling
+process's own view shrinks with each unveil while the unveil call itself
+resolves unrestricted; the final component is re-resolved by name inside the
+kernel, a residual documented in the design. The shipped default policy
+becomes backend-specific.
 
 Version 0.5.0 incorporates a third round of the independent review. Changes
 since 0.4.0: the policy file is read to end of file rather than to the size
