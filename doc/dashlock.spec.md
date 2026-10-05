@@ -4,10 +4,12 @@
 
 Deployment:   enhance-existing
 Language:     any
-Version:      0.6.0
+Version:      0.7.0
 Spec-Schema:  0.4.0
 Hints-file:   dashlock.c.hints.md
 Author:       Matthias G. Eckermann
+Assisted-by:  Claude:claude-fable-5
+Assisted-by:  Vibe (Mistral AI)
 License:      BSD-3-Clause
 Verification: none
 Safety-Level: QM
@@ -795,7 +797,7 @@ STEPS:
    any symbolic-link component; verify that the final component exists and
    is not a symbolic link; keep the handle of the verified parent directory.
    On any failure → refuse with reason "cannot open rule path <path>". A
-   rule naming the root directory itself has no parent: it needs no walk,
+   rule for the root directory itself has no parent: it needs no walk,
    the root cannot be a symbolic link, and step 7 applies it as an unveil
    of "/" without a directory change.
 7. For every PathRule, in policy order: change directory to the verified
@@ -833,6 +835,111 @@ ERRORS:
 - Refusal "cannot lock unveil"
 - Refusal "cannot set execution promises"
 - Refusal "cannot restore working directory"
+
+## BEHAVIOR: validate-policy
+
+Constraint: optional
+
+Reports whether a policy is well-formed and whether it would apply, without
+confining anything. This behavior is the contract of a separate binary,
+`dashlock-check`; the shell does not perform it. It exists so that an
+administrator can check a policy before it reaches a session, instead of
+learning of a mistake from a broken login.
+
+MECHANISM: validate-policy reuses resolve-user-key, locate-policy-file,
+open-and-validate-policy-file, parse-policy, and compute-required-abi,
+unchanged and in the same order the shell runs them; in kernel mode it also
+queries the running Landlock ABI the same way enforce-policy-landlock does.
+It shares one parser and one set of trust checks with enforce-policy, so a
+judgment it reports and a judgment the session makes cannot diverge. It
+stops before enforce-policy: no ruleset is created, no unveil or pledge call
+is made, the calling process is never confined. The refusal behavior is
+reused exactly: the same message and the same exit 78 that a session would
+print. Because the session stops at its first refusal, validate-policy
+reports at most one refusal in validate and kernel modes, which is what makes
+"run the tool, get the session's report" true. No second implementation of
+refuse is introduced.
+
+The shell translation unit, built as the shell, never reaches this behavior;
+validate-policy exists only in the separate binary. The one change inside
+that translation unit is a code motion: each backend's pre-kernel checks
+move into a function of their own, which the apply function calls first and
+the checker calls directly. This is a build-contract property, stated in the
+hints file.
+
+INPUTS:
+```
+mode:      "validate" | "kernel" | "dump"   // default "validate"
+userkey:   the account whose policy to read  // default: the caller's own
+narrowkey: NarrowName | absent               // checked as the session would; dumped side by side
+lints:     boolean                           // emit advisory lints on stderr
+quiet:     boolean                           // machine-readable findings, one per line
+```
+
+PRECONDITIONS:
+- The trust checks on the policy path run as the invoking identity, so a run
+  by root validates what root would receive and a run by an unprivileged user
+  validates what that user would receive. The result is valid for the
+  invoking identity, which the output states.
+- Nothing in this behavior depends on the invoking process being the shell,
+  being confined, or being gated on an invocation name.
+
+STEPS:
+1. Resolve userkey (resolve-user-key); default to the caller's own key.
+2. Locate and open the policy (locate-policy-file,
+   open-and-validate-policy-file). A trust-check failure is reported exactly
+   as the session reports it, with exit 78, and validation stops.
+3. Parse the policy (parse-policy) into a private copy of the buffer, so that
+   the normalized form is available for dump mode after the in-place split.
+   A parse refusal is reported as the session reports it, with exit 78.
+4. If narrowkey is present: on the unveil backend → the refusal
+   consume-narrow-argument raises, exit 78; on the landlock backend, locate,
+   open, and parse the narrowing policy exactly as the session does, and
+   apply the cross-checks of step 5 to it as well.
+5. In validate and kernel modes, run every cross-check enforce-policy runs
+   before it would create a ruleset: the backend-contract refusals for the
+   build's backend, the required-ABI derivation on the Landlock backend, and
+   on the unveil backend the class mapping and the rule-maps-to-nothing
+   check. Any refusal is reported with exit 78.
+6. In kernel mode, additionally query the running Landlock ABI the way
+   enforce-policy-landlock does, and report the derived required ABI, the
+   explicit floor, the ceiling in force, and the running kernel's ABI, with
+   a statement that the judgment is for this kernel only.
+7. In dump mode, print the normalized policy: handled rights per category,
+   each PathRule with its rights, each NetRule, the scope set, the pledge
+   set, and the derived required ABI. When narrowkey is present, print the
+   base policy and the narrowing policy as two separate normalized blocks.
+   Dump mode does not compute a narrowing intersection; the kernel is the
+   only component that intersects layers.
+8. If lints is set, emit advisory findings on stderr. Lints never change the
+   exit code. The lint set is backend-appropriate and is listed in the hints
+   file rather than in this specification, because lints are recommendations
+   and none of them decides whether a policy applies.
+9. Exit 0 when the policy would apply, 78 when it would not, 2 on a usage
+   error such as an unknown mode or an unreadable argument.
+
+POSTCONDITIONS:
+- The calling process is not confined and no confinement system call was made
+- Every pass-or-fail judgment matches what enforce-policy would decide for the
+  same policy, backend, and identity
+- Advisory lints did not affect the exit code
+
+ERRORS:
+- Every refusal that resolve-user-key, open-and-validate-policy-file,
+  parse-policy, or the pre-enforcement cross-checks would raise, with the same
+  message and exit 78
+- Exit 2 on a usage error, which is distinct from a policy refusal
+
+NOTES:
+- validate-policy adds no option to the shell. The shell's only pre-shell
+  argument handling stays consume-narrow-argument; a check mode on the shell
+  binary would add argument surface to the one path that must remain inert,
+  so the behavior lives only in the separate binary.
+- A computed preview of the narrowing intersection is deliberately absent. It
+  would require modeling layer intersection in user space, which would drift
+  from the kernel; a preview that can misstate what a session allows is worse
+  than none. The side-by-side dump gives the reviewer both layers without
+  claiming to compute their intersection.
 
 ## BEHAVIOR: refuse
 
@@ -965,6 +1072,10 @@ Environment conditions:
 - [observable]  On the unveil backend, a --narrow request is refused before any policy file is read
 - [observable]  On the unveil backend, the unveil set is locked and the execution promises are installed before any profile file, rc file, or command is read
 - [implementation]  On the unveil backend, no unveil call is issued before every rule path has been verified on open directory handles
+- [observable]  validate-policy confines nothing: it makes no confinement system call and the invoking process is not restricted afterwards
+- [observable]  validate-policy reports a given policy's pass-or-fail judgment with the same message and exit code the session would produce for it
+- [observable]  Advisory lints from validate-policy are written to the standard error descriptor and never change its exit code
+- [implementation]  validate-policy introduces no second implementation of refuse and no check option on the shell binary; the shell translation unit built as the shell never reaches validate-policy
 
 ## EXAMPLES
 
@@ -1238,6 +1349,65 @@ THEN:
   exit code is 78
   the directive is not silently ignored
 
+### EXAMPLE: check_reproduces_a_session_refusal
+GIVEN:
+  the landlock backend
+  /etc/dashlock/users/agent handles the filesystem wildcard and contains one
+    rule granting a right outside the handled set
+WHEN:
+  dashlock-check is run in validate mode for user agent
+THEN:
+  validate-policy stops at parse-policy with the same refusal the session raises
+  the message is "rule for <path> uses access not handled in /etc/dashlock/users/agent"
+  exit code is 78
+  no confinement system call was made and the invoking process is not confined
+
+### EXAMPLE: check_dumps_normalized_policy
+GIVEN:
+  the unveil backend
+  a valid policy for user agent with a pledge directive and several path rules
+WHEN:
+  dashlock-check is run in dump mode for user agent
+THEN:
+  the normalized policy is printed: handled categories, each path rule with its
+    rights, the scope set, the pledge set, and the derived required ABI
+  exit code is 0
+  no narrowing intersection is computed, because the kernel is the only
+    component that intersects layers
+
+### EXAMPLE: check_kernel_mode_reports_abi_shortfall
+GIVEN:
+  the landlock backend on a kernel with Landlock ABI version 4
+  a valid policy for user agent containing "scope signal", which needs ABI 6
+WHEN:
+  dashlock-check is run in kernel mode for user agent
+THEN:
+  the report states required ABI 6, the policy floor, the ceiling in force,
+    kernel ABI 4, and that the judgment holds for this kernel only
+  refuse is called with reason "policy needs landlock ABI 6, kernel provides 4"
+  exit code is 78, the same the session would produce here
+
+### EXAMPLE: check_refuses_narrowing_on_unveil_backend
+GIVEN:
+  the unveil backend
+  a valid policy for user agent
+WHEN:
+  dashlock-check is run in validate mode for user agent with narrowkey readonly
+THEN:
+  refuse is called with reason "narrowing is not supported by this backend"
+  exit code is 78
+  no narrowing policy file is read, as in the session
+
+### EXAMPLE: check_usage_error_is_not_a_refusal
+GIVEN:
+  any backend
+WHEN:
+  dashlock-check is run with an unknown mode
+THEN:
+  a usage message is written
+  exit code is 2, distinct from a policy refusal
+  no policy file was read
+
 ## DEPENDENCIES
 
 No new external library. The addition uses the platform standard library
@@ -1301,6 +1471,50 @@ COMPONENT: documentation
            the policy format, the exit status, and the limits
   required: true
 
+COMPONENT: policy-checker
+  purpose: Implements validate-policy as a separate binary, dashlock-check
+  required: false
+  note: A second translation unit that includes dashlock.c, as the unit
+        drivers in the hints file do, so it shares resolve-user-key,
+        locate-policy-file, open-and-validate-policy-file, parse-policy,
+        compute-required-abi, the backend pre-kernel checks, and refuse with
+        the shell, and cannot diverge from them. It adds no option to the
+        shell binary. It ships with its own manual page, dashlock-check(8).
+        Target files src/dashlock-check.c, src/dashlock-check.8, and the build
+        rule in src/Makefile.am.
+
+COMPONENT: test-suite
+  purpose: Table-driven parser and cross-check tests, recording-stub
+           enforcement-sequence tests, filesystem-fixture trust tests, and
+           on-kernel confinement and backend-contract tests
+  required: true
+  note: Each negative example in this specification is one test row asserting
+        the exact refusal message and exit 78; the review findings of
+        2026-10-04 are named regression rows. The enforcement-sequence tests
+        record through the system-call wrappers rather than confining. Tests
+        and fixtures live in their own directory with their own make target,
+        so the diff against upstream stays limited to the files the fork
+        already touches. The confinement and ABI-refusal tests need a
+        controlled kernel; the host matrix is a deployment concern, described
+        in the design document and the hints file, not here.
+
+COMPONENT: fuzz-driver
+  purpose: Coverage-guided fuzzing of the parse path, seeded with the shipped
+           policies
+  required: false
+  note: A forking fuzzer driver; a clean exit 78 is a normal result to it,
+        so no refusal path changes for fuzzing. Bounded on each commit, longer
+        on a schedule.
+
+COMPONENT: continuous-integration
+  purpose: Runs the test-suite layers on every commit: the host-independent
+           layers on a hosted runner, the on-kernel layers in a virtual
+           machine with a pinned kernel, the OpenBSD leg in a local virtual
+           machine
+  required: false
+  note: The build matrix and the kernel-control requirement are in the
+        design document and the hints file.
+
 ## TOOLCHAIN-CONSTRAINTS
 
 - New external library: forbidden.
@@ -1309,8 +1523,15 @@ COMPONENT: documentation
   policy has to grant read and execute on the library tree for the child
   processes in any case, so a static shell would not shrink the policy.
 - Change to the shell's parser, option handling, or built-ins: forbidden.
+  The policy checker is a separate binary and adds no option to the shell;
+  the shell's only pre-shell argument handling stays consume-narrow-argument.
 - Behavior change when the binary is invoked under a name other than the
-  trigger name: forbidden.
+  trigger name: forbidden. This is a testable property: a `--disable-dashlock`
+  build is expected to be identical to upstream dash 0.5.13.5 built from the
+  same release tarball with the same flags and a fixed source-date epoch, and
+  with the gate enabled the only differences among the sources compiled
+  into the shell are the two lines in src/main.c and the added translation
+  unit.
 
 Build-time options:
 
@@ -1328,6 +1549,29 @@ Whether the gate applies is a property of the binary, not of its runtime
 environment.
 
 ## DELTA
+
+Version 0.7.0 adds assurance; the confinement behavior is unchanged. It
+introduces validate-policy,
+an optional behavior realized as a separate binary, dashlock-check, that
+reports whether a policy is well-formed and whether it would apply, while
+confining nothing. The checker reuses the shell's own resolve-user-key,
+lookup, trust checks, parser, required-ABI derivation, and refuse, so a
+judgment it reports cannot diverge from a session's; it adds no option to the
+shell binary, and it introduces no second implementation of refuse. Its
+validate, kernel, and dump modes are specified, along with advisory lints that
+never change the exit code. A computed preview of the narrowing intersection
+was considered and rejected: user-space modeling of Landlock layer
+intersection would drift from the kernel, so dump mode prints both layers
+side by side and leaves the intersection to the kernel. The revision also
+makes two existing promises testable: every negative example is now a required
+test row, and the inertness promise is pinned to a byte-identity comparison
+against upstream 0.5.13.5. A test-suite deliverable is added. The confinement
+behaviors, the grammar, and the backend contract are unchanged from 0.6.0;
+this revision adds no directive and changes no refusal; the one change inside
+the shell's translation unit is a code motion that exposes each backend's
+pre-kernel checks to the checker. The assurance design was proposed by Vibe
+(Mistral AI) in the review of 2026-10-04 and amended as recorded in design.md
+section 8.
 
 Version 0.6.0 adds a second enforcement backend, unveil and pledge on
 OpenBSD, without changing the grammar's parser model: one grammar, one

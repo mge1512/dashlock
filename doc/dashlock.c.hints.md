@@ -3,6 +3,14 @@
 Language hints for `dashlock.spec.md`: C on Linux, and C on OpenBSD for the
 unveil backend.
 
+Author: Matthias G. Eckermann
+Assisted-by: Claude:claude-fable-5
+Assisted-by: Vibe (Mistral AI)
+
+The test-seam, policy-checker, and host-matrix sections were added on
+2026-10-06, from the proposal Vibe (Mistral AI) made in the review of
+2026-10-04.
+
 These are implementation facts that do not belong in the specification, which
 is language-agnostic. They are advisory and cannot override a spec invariant.
 Where a hint and the spec disagree, the spec wins and the hint is wrong.
@@ -346,3 +354,103 @@ option exists.
   numbers 437/444/445/446. A port to a different architecture must confirm them.
 - glibc and musl both provide `getpwuid_r`, `openat2` wrappers vary, which is
   why the syscall is issued directly rather than through a libc wrapper.
+
+## Test seam: recording wrappers
+
+The enforcement-sequence tests reuse the `#include "dashlock.c"` unit-driver
+pattern that the review compiles already use. The seam is the system-call
+wrapper layer, not the behavior functions: `dl_sys_create`, `dl_sys_add`,
+`dl_sys_restrict` on Landlock, and the `unveil`/`pledge` entry points on
+OpenBSD. A test build provides recording implementations of these that
+append each call and its arguments to a buffer and return success, instead
+of entering the kernel. The behavior code above them is then exercised
+unchanged, and the test asserts the recorded sequence: on Landlock, the
+attribute size per ABI branch, the handled masks after wildcard expansion,
+and that no restrict call follows a failed add; on unveil, that every rule
+path is verified before the first `unveil`, the class string per rule, the
+lock, and the execpromises string. On a Linux host the unveil wrappers are
+linked as stub implementations, not only declared, so the unveil sequence
+runs there as well as compiling.
+
+The parser and cross-check tests need no seam at all: they call
+`dl_parse`, the lookup functions, and `dl_required_abi` directly and read
+the refusal through the process exit, one table row per negative example in
+the specification. The four review findings of 2026-10-04 are named rows:
+the network-wildcard drop, the non-directory ancestor fall-through, the
+errno-after-close misclassification, and the truncated-read-as-narrowing
+case.
+
+One trust-check case must not be written as a race. A file that grows
+between the size check and the end of the read is driven through the
+size-and-identity re-check path by a seam, not by racing a second process
+that appends while the reader runs, which would be nondeterministic in
+automation. A single genuine-race run stays a manual check.
+
+## The policy checker: dashlock-check
+
+`dashlock-check.c` includes `dashlock.c` the way the unit drivers do and
+provides its own `main`, so it links the shell's own `dl_user_key`,
+`dl_load` (lookup, trust checks, and `dl_parse`), `dl_required_abi`, and
+`dl_refuse`. One code motion inside `dashlock.c` makes the pre-kernel checks
+callable without confining: the pledge-directive refusal of
+enforce-policy-landlock step 1 moves into `dl_landlock_check()`, and steps 1
+to 4 of enforce-policy-unveil (the contract refusals and the class mapping)
+move into `dl_unveil_check()`; each apply function calls its check function
+first, unchanged in effect, and the checker calls them directly. Pure
+extraction, no semantic change, covered by the sequence tests. No sink abstraction is
+introduced: the write-and-exit refusal the shell uses is exactly what the
+checker wants, because validate and kernel modes report at most the one
+refusal a session would hit first. Dump mode runs after a successful parse,
+so it needs the parsed policy intact; since `dl_parse` splits the buffer in
+place, the checker parses a private copy and keeps the original for the
+normalized printout.
+
+The shell translation unit built as the shell never reaches validate-policy:
+the behavior is implemented in `dashlock-check.c`, which has its own `main`,
+and the
+shell's `main` is `src/main.c` with its two-line hook. The build contract
+(`#error` guard plus the `-include config.h` line) already guarantees the
+shell binary is the confining one; the checker is a separate target and a
+separate binary.
+
+Advisory lints are emitted on the standard error descriptor and never change
+the exit code. The set is backend-appropriate:
+
+- Landlock: a rule tree that grants neither read nor execute on the library
+  directories the loader needs; the loader cache (`/etc/ld.so.cache`)
+  unreadable; `ioctl-dev` missing on the terminal devices for a policy that
+  looks interactive.
+- Either backend: a declared access category with no rules in it; a policy
+  for an interactive account that grants nothing under the account's home
+  directory.
+
+These are recommendations, phrased in plain language and labeled advisory,
+so they never dilute the pass-or-fail judgment. `/etc/ld.so.cache` and the
+loader-tree lint are Linux-only; the unveil backend's loader paths differ
+and its default policy grants them through the `/usr` and `/bin` rules.
+
+## Host matrix for the on-kernel tests
+
+The parser, cross-check, and sequence tests run on any host. The
+confinement and ABI-refusal tests need a kernel the test build controls, which a hosted runner does not
+provide. A virtual machine with a pinned kernel and
+controlled boot parameters is the deterministic option: it boots kernels on
+both sides of a policy's ABI to exercise `abi-min` and `abi-max` refusal in
+both directions, and boots with Landlock removed from the LSM list to
+exercise the unavailable-kernel path. The OpenBSD leg has no hosted runner
+either; it runs in a local virtual machine under the platform's own
+hypervisor, the same sandbox the backend was first verified in.
+
+The build matrix: `--disable-dashlock` (must produce plain dash),
+`--enable-dashlock`, and `--disable-dashlock-name-gate`; a
+`--enable-dashlock` build on a host where `linux/landlock.h` is hidden must
+fail; gcc and clang with `-Wall -Wextra -Werror`; one parser build under the
+undefined-behavior and address sanitizers. The inertness check compares a
+`--disable-dashlock` build byte-for-byte against upstream dash 0.5.13.5 built
+from the same tarball with the same flags and a fixed `SOURCE_DATE_EPOCH`.
+
+A coverage-guided fuzzer over the parse path, seeded with the shipped
+policies, needs no change to the refusal paths when it is a forking fuzzer:
+a clean `_exit(78)` is a normal result, not a crash. An in-process fuzzer
+would need the parser not to exit, which is not justified for the confined
+code; use the forking driver.
