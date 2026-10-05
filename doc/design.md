@@ -6,6 +6,8 @@ pieces fit together. The normative statement of behavior is
 alternatives that were considered and rejected.
 
 Author: Matthias G. Eckermann
+Assisted-by: Claude:claude-fable-5
+Assisted-by: Vibe (Mistral AI)
 
 ## 1. Summary
 
@@ -523,7 +525,207 @@ section 6.6 is deliberate.
   exactly the kind of security-relevant complexity the kernel does for free
   on Linux. Deferred until something needs it.
 
-## 8. Sequencing
+## 8. Assurance: testing and policy validation
+
+Sections 1 to 7 describe what is confined and why. This section describes
+how the confinement is kept correct over time, and how an administrator
+checks a policy before it reaches a session. Both came out of the review of
+2026-10-04; Vibe (Mistral AI) proposed them in that review, and the
+corrections below are the result of reconciling the proposal with the
+mechanisms as built.
+
+The motivation is concrete. Three independent reviews
+found four defects, and all four were in refusal logic: a network wildcard
+that could apply with its network portion dropped, a non-directory component
+in a higher-priority policy path that could fall through to a lower-priority
+file, an errno read after close() that misclassified an open failure, and a
+truncated read that could pass as narrowing. A defect in a refusal path does
+not announce itself: the session still starts, and it starts weaker than the
+policy says. Reviews are point-in-time, and nothing in the tree reruns them.
+The development matrix (recording stubs, a kernel with Landlock compiled
+out, sessions on Linux 6.12 and OpenBSD 7.9) proved itself while the backend
+was built, but it exists in a developer's shell history and not in the
+repository.
+
+### 8.1 Test layers
+
+The layers are ordered by cost. The cheap ones run on any host and catch the
+class of defect the reviews actually found; the expensive ones need a kernel
+and answer the question the cheap ones cannot.
+
+Layer 1, parser and validation, pure C with no kernel and no filesystem. The
+specification already lists, for every behavior, its preconditions, steps,
+postconditions, error exits, and one negative example per error exit. That is
+a test table: one row per negative example, asserting the exact refusal
+message and exit 78. The four review findings become four named regression
+rows. This layer is where most of the regression risk goes away for the least
+effort, because the parser and the cross-checks are where the defects were.
+
+Layer 2, the enforcement sequence, with recording stubs. The Landlock calls
+pass through the `dl_sys_*` wrappers, which is the test seam: a build whose
+wrappers record instead of calling the kernel lets the sequence be asserted
+without privilege. What to assert differs per backend, and stating one
+backend's invariant for the other would assert the wrong thing. On Landlock:
+the ruleset attribute size matches the ABI branch, the handled masks match
+the policy including wildcard expansion against the queried ABI, and
+`restrict_self` is never reached after a failed `add_rule`.
+On unveil the invariant is different and stronger: every rule path is
+verified before the first `unveil` call, because the process's own view
+shrinks with each call while `unveil` itself resolves unrestricted.
+
+Layer 3, policy-file trust, which needs a filesystem fixture: root-owned and
+non-root files, group-writable directories, a symbolic link in each position
+of the chain, a FIFO, a file with a NUL byte, a file above the size ceiling,
+and a truncated file. Each must refuse with its documented message, and only
+a fully valid path may pass. The ownership checks need root-owned files, so
+this group runs as root in a disposable environment, which also exercises the
+real descriptor walk. One case does not belong in this group as a race: a
+file that grows between the size check and the read. Racing an appender
+against the reader is nondeterministic and will flake in automation; the
+size-and-identity re-check is driven through a test seam instead, and a
+single genuine-race run is kept as a manual check outside the automated set.
+
+Layer 4, confinement on a real kernel: build the shell, install a policy for
+a dedicated test account, start `dashlock`, and probe. An allowed read
+succeeds, a denied read returns the documented error and exit status, the
+domain survives `execve` into another interpreter, and every refusal category
+produces exit 78. Only this layer exercises a confined session itself; the
+others exercise models of it.
+
+Layer 5, the backend contract. The refusal matrix (`access net-tcp`, `rule
+net-port`, `scope`, a partial filesystem category, and `--narrow` on unveil;
+the `pledge` directive on Landlock) is asserted as exit 78 on both backends.
+The unveil backend already declares its prototypes for review hosts, so it
+compile-checks on Linux; linking stub implementations of `unveil` and
+`pledge` lets its sequence tests run there too, which is how the September
+work verified the sequence before the OpenBSD sandbox existed.
+
+### 8.2 Inertness as a tested property
+
+The promise that the binary is byte-for-byte upstream dash under any other
+name is a security claim, and it can be checked mechanically rather than
+argued. A `--disable-dashlock` build should be identical to upstream dash
+0.5.13.5 built from the same release tarball with the same flags and a fixed
+`SOURCE_DATE_EPOCH`; with the gate enabled, the only differences among the
+sources compiled into the shell are the two lines in `main.c` and the added
+`dashlock` translation unit. The
+behavioral corpus that backs this up stays small on purpose: it needs to
+cover the option-parsing paths around the `--narrow` consumption, the only
+point where the fork touches argv before the shell starts. The baseline is
+upstream 0.5.13.5, not dash master, because comparing against master would
+measure upstream's drift since the fork point rather than anything about the
+fork.
+
+### 8.3 Build matrix and the parser as attack surface
+
+The configurations that must be built: `--disable-dashlock` (produces plain
+dash), `--enable-dashlock`, and `--disable-dashlock-name-gate`. A build with
+`--enable-dashlock` on a host where `linux/landlock.h` has been hidden must
+fail, which is the fail-the-build contract made executable. Compilers are gcc
+and clang with `-Wall -Wextra -Werror`, and one parser build runs under the
+undefined-behavior and address sanitizers.
+
+The confinement and ABI-refusal tests need control over the kernel, which a
+hosted runner does not give. A virtual machine with a pinned kernel and
+controlled boot parameters is the deterministic option: the same image boots
+kernels on both sides of a policy's ABI to exercise the `abi-min` and
+`abi-max` refusal paths in both directions, and boots with Landlock disabled
+to exercise the unavailable-kernel path. There is no hosted OpenBSD runner;
+the OpenBSD leg runs in a local virtual machine under the platform's own
+hypervisor, the same sandbox the backend was first tested in.
+
+The parser is the pre-domain attack surface: it runs unconfined, before the
+domain exists, on administrator-supplied input. Once the Layer 1 tests exist,
+a coverage-guided fuzzer over the parse path seeded with the shipped policies
+is cheap to add. A forking fuzzer needs no change to the refusal paths,
+because a clean `_exit(78)` is a normal result to it, not a crash; only an
+in-process fuzzer would require the parser not to exit, and that change is not
+justified for the confined code. Run it bounded on each commit and longer
+on a schedule.
+
+Tests and fixtures live in their own directory with their own make target, so
+the diff against upstream stays limited to the files the fork already touches.
+
+## 9. A policy validation tool
+
+An administrator today has two ways to find out that a policy is wrong: read
+the specification and the manual page closely, or install the policy and open
+a session. The first misses mistakes; the second breaks the session on the
+account in question, and on kernel 6.12 the only diagnostic for a denial is
+the error plus a system-call trace. Audit records arrive with ABI 7 on 6.15,
+which helps after an incident but still does not tell an author in advance
+whether a policy is well-formed and applicable.
+
+The tool is a separate binary, `dashlock-check`, and the shell binary is left
+untouched. Putting a check option on `dashlock` itself is not viable: any
+first argument is a potential command name, and the existing `--narrow`
+handling works only because it is consumed before the shell parses arguments.
+That exception should stay the only one. The checker is built from the same
+translation unit as the shell and uses the same lookup and parse code, so
+validation and enforcement cannot diverge. It does this as a second
+translation unit, `dashlock-check.c`, that includes `dashlock.c` the way the
+unit drivers in the hints file do, provides its own entry point, calls the
+same user-key, lookup, parse, and cross-check functions the shell calls, and
+stops before enforcement. The one change this needs inside `dashlock.c` is
+a code motion: each backend's pre-kernel checks move into a function of
+their own, which the apply function calls first and the checker calls
+directly. No second implementation of the refusal
+functions is introduced; the refusal path that the four defects lived in is
+not rebuilt for the checker, it is reused unchanged. First-finding-only is the
+correct fidelity, because a session also stops at the first problem, so the
+tool reproducing a session refusal reports exactly what the session reported.
+
+Modes:
+
+- Validate, the default. Read the policy the given user would receive,
+  through the same lookup order and the same trust checks on the path, parse
+  it, run every cross-check, and exit 0 when it would apply or 78 with the
+  session's own message when it would not. Same message, same exit code: an
+  administrator can reproduce a refusal and get the session's report.
+- Kernel. Additionally query the running Landlock ABI and report whether the
+  policy applies on this kernel: the derived required ABI, `abi-min`, any
+  ceiling, and the kernel value. Meaningful only on the deployment kernel or
+  a copy of it, which the output states. If the ABI ceiling moves from the
+  policy into the binary, this mode reports the binary's ceiling rather than
+  a policy line.
+- Dump. Print the normalized policy: handled rights per category, each path
+  rule with its rights, net-port rules, scopes, the pledge set, and the
+  derived required ABI. This is a canonical form, diffable between revisions
+  and storable next to a policy as its reviewed meaning.
+- Advisory lints, on stderr, never changing the exit code. The omissions that
+  read like permission bugs belong in these lints, each one backend-specific: on
+  Landlock, read and execute on the library tree missing, or the loader cache
+  unreadable; on either backend, an interactive account whose policy grants
+  nothing under the home directory, a declared access category with no rules,
+  or an interactive session without terminal-device access. These are plain-
+  language recommendations, labeled advisory, so the hard pass-or-fail
+  semantics stay undiluted.
+- Machine-readable output, a quiet form with one finding per line (file, line
+  number, kind, message), so a policy repository can gate commits. The
+  shipped policies are validated this way on every change.
+
+One mode from the proposal is deliberately left out. A computed preview of
+the `--narrow` intersection would have to model, in user space, how Landlock
+intersects layers: per right, per layer, with rules accumulating along a
+path. That model would drift from the kernel, and a preview that can be
+wrong about what a session allows is worse than none. The checker prints the
+base policy and the narrowing policy side by side and lets the reader see
+both; the kernel alone computes the intersection.
+
+What the tool does not promise: that a session under the policy can log in
+and do useful work. That is behavior, and it belongs to the Layer 4
+confinement tests, which apply a policy in a disposable session and probe
+expected allowed and denied operations. The checker answers whether a policy
+is well-formed and applicable; the confinement tests answer whether a
+confined session behaves as intended. The two are strongest together, which
+is also the order of work: the parser tests, the stub sequence tests, and the
+checker's validate mode first, since all three harden the code that runs
+before the domain exists and the checker reuses the test scaffolding; then the
+file-trust and confinement tests; then the checker's dump and kernel modes;
+then the virtual-machine kernel control, the fuzzer, the OpenBSD leg, and the
+inertness corpus.
+
+## 10. Sequencing
 
 | Phase | Deliverable | Where |
 | --- | --- | --- |
@@ -550,14 +752,14 @@ review, and the specification records the resulting change log. The findings
 that became code fixes are recorded there. The ones that remain deployment
 preconditions, a trusted launcher, a sanitized loader environment,
 unprivileged user namespaces disabled, and no file capabilities on the binary,
-are in section 9 and in the manual page, because self-confinement in a
+are in section 11 and in the manual page, because self-confinement in a
 dynamically linked binary cannot close them from inside.
 
 Packaging follows the usual route: signed packages built in the Open Build
 Service, with the policy files in a separate package so that a policy change
 does not require a shell rebuild.
 
-## 9. Limits
+## 11. Limits
 
 What this design does not do, in each case for a structural reason rather
 than a missing feature.
@@ -619,7 +821,7 @@ Limits specific to the unveil and pledge backend:
   filesystem category: rule 1 of section 7.2 refuses each of them rather
   than approximating.
 
-## 10. Open questions
+## 12. Open questions
 
 1. Does the policy for the agent account belong in the `dashlock` package, in a
    separate policy package, or in a configuration management layer? A separate
@@ -638,7 +840,7 @@ Limits specific to the unveil and pledge backend:
 5. Does anything else we ship want the same treatment? The pattern generalizes
    to any process that reads untrusted instructions and then runs commands.
 
-## 11. References
+## 13. References
 
 - Landlock user-space documentation: `Documentation/userspace-api/landlock.rst`
   in the kernel tree, and `landlock(7)`
@@ -649,3 +851,5 @@ Limits specific to the unveil and pledge backend:
 - `setpriv(1)`, util-linux 2.40 and later, for the access right vocabulary
 - Trail of Bits, "VMs won't contain cyber-capable agents", 2026-08-26
 - dash upstream: Herbert Xu, current release 0.5.13.5
+- Vibe (Mistral AI), review of 2026-10-04: the proposal behind the test
+  infrastructure of section 8 and the policy validation tool of section 9
