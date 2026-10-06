@@ -26,7 +26,10 @@ chmod 0755 "$WORK"
 cleanup() { rm -f "$ETC/users/$KEY"; rm -rf "$WORK"; }
 trap cleanup EXIT
 mkdir -p "$ETC/users"
-ln -sf "$SHELLBIN" "$WORK/dashlock"
+# copies, not links: the test account must be able to execute them even
+# when the build tree sits under a home directory it cannot traverse
+cp "$SHELLBIN" "$WORK/dashlock" && cp "$SHELLBIN" "$WORK/dash"
+chmod 0755 "$WORK/dashlock" "$WORK/dash"
 echo "outside the set" > "$WORK/secret"; chmod 0644 "$WORK/secret"
 mkdir "$WORK/box"; chmod 01777 "$WORK/box"
 cat > "$ETC/users/$KEY" << END
@@ -58,7 +61,7 @@ D="$WORK/dashlock"
 echo "1..8"
 check "allowed read succeeds" 0 "localhost" "$D" -c 'cat /etc/hosts'
 check "a path outside the set reports ENOENT" 1 "No such file" "$D" -c "cat $WORK/secret"
-check "the same read succeeds as plain dash (name gate)" 0 "outside the set" "$SHELLBIN" -c "cat $WORK/secret"
+check "the same read succeeds as plain dash (name gate)" 0 "outside the set" "$WORK/dash" -c "cat $WORK/secret"
 check "the set survives execve into another interpreter" 1 "No such file" "$D" -c "/bin/sh -c 'cat $WORK/secret'"
 check "write inside the set works" 0 "" "$D" -c "echo x > $WORK/box/f && rm $WORK/box/f"
 check "a set-ID binary is refused at exec (dash reports 126)" 126 "Permission denied" "$D" -c 'ping -c1 127.0.0.1'

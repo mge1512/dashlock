@@ -32,7 +32,10 @@ cleanup() { rm -f "$ETC/users/$KEY" "$ETC/narrow/t-ro"; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 mkdir -p "$ETC/users" "$ETC/narrow"
-ln -sf "$SHELLBIN" "$WORK/dashlock"
+# copies, not links: the test account must be able to execute them even
+# when the build tree sits under a home directory it cannot traverse
+cp "$SHELLBIN" "$WORK/dashlock" && cp "$SHELLBIN" "$WORK/dash"
+chmod 0755 "$WORK/dashlock" "$WORK/dash"
 echo "outside the allowlist" > "$WORK/secret"; chmod 0644 "$WORK/secret"
 mkdir "$WORK/box"; chmod 01777 "$WORK/box"
 
@@ -84,7 +87,7 @@ D="$WORK/dashlock"
 echo "1..10"
 check "allowed read succeeds" 0 "hosts" as_user "$D" -c 'cat /etc/hosts | head -1; echo hosts'
 check "denied read fails with EACCES" 1 "Permission denied" as_user "$D" -c "cat $WORK/secret"
-check "the same read succeeds as plain dash (name gate)" 0 "outside the allowlist" as_user "$SHELLBIN" -c "cat $WORK/secret"
+check "the same read succeeds as plain dash (name gate)" 0 "outside the allowlist" as_user "$WORK/dash" -c "cat $WORK/secret"
 check "domain survives execve into another interpreter" 1 "Permission denied" as_user "$D" -c "/bin/sh -c 'cat $WORK/secret'"
 check "no_new_privs is set in the session" 0 "NoNewPrivs:	1" as_user "$D" -c 'grep NoNewPrivs /proc/self/status'
 check "write inside the allowlist works" 0 "" as_user "$D" -c "echo x > $WORK/box/f && rm $WORK/box/f"
