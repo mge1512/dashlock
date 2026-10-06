@@ -23,11 +23,17 @@ dash_CFILES = \
 	bltin/printf.c system.c bltin/test.c bltin/times.c var.c
 
 # dashlock.c is deliberately kept out of dash_CFILES: that variable is the
-# input to mkinit, and the Landlock code must take no part in the shell's
+# input to mkinit, and the confinement code must take no part in the shell's
 # init machinery.  It is also the only source file that must not include a
 # shell header, because main.h redefines errno as (*dash_errno) and
-# dash_errno is only assigned inside main().
+# dash_errno is only assigned inside main().  With the feature disabled the
+# object is not linked at all, so a --disable-dashlock build is byte for
+# byte the upstream shell (tests/t_inertness.sh checks exactly that).
+if BUILD_DASHLOCK
 dashlock_CFILES = dashlock.c
+else
+dashlock_CFILES =
+endif
 
 dash_SOURCES = \
 	$(dash_CFILES) \
@@ -40,6 +46,20 @@ dash_SOURCES = \
 	show.h system.h trap.h var.h
 dash_LDADD = builtins.o init.o nodes.o signames.o syntax.o
 
+# The policy checker is a second translation unit that includes dashlock.c
+# (BEHAVIOR validate-policy); it links nothing from the shell proper.
+# Warning flags for the fork's own objects only: upstream dash does not
+# build under -Wextra -Werror, the fork's code does, and CI passes
+#   make DASHLOCK_WARN_CFLAGS="-Wall -Wextra -Werror"
+# The checker compiles dashlock.c through its include, so this covers both.
+DASHLOCK_WARN_CFLAGS =
+
+if BUILD_DASHLOCK
+bin_PROGRAMS += dashlock-check
+dashlock_check_SOURCES = dashlock-check.c
+dashlock_check_CFLAGS = $(AM_CFLAGS) $(DASHLOCK_WARN_CFLAGS)
+endif
+
 HELPERS = mkinit mksyntax mknodes mksignames
 
 BUILT_SOURCES = builtins.h nodes.h syntax.h token.h token_vars.h
@@ -48,8 +68,11 @@ CLEANFILES = \
 	$(HELPERS) builtins.def
 
 man_MANS = dash.1
+if BUILD_DASHLOCK
+man_MANS += dashlock-check.8
+endif
 EXTRA_DIST = \
-	$(man_MANS) \
+	$(man_MANS) dashlock-check.8 dashlock-check.c dashlock.c \
 	mktokens mkbuiltins builtins.def.in mkinit.c \
 	mknodes.c nodetypes nodes.c.pat mksyntax.c mksignames.c
 

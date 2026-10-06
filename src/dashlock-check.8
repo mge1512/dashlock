@@ -1,0 +1,148 @@
+.\" dashlock-check(8): the dashlock policy checker
+.\" BSD-3-Clause, see the dashlock documentation
+.Dd October 6, 2026
+.Dt DASHLOCK-CHECK 8
+.Os
+.Sh NAME
+.Nm dashlock-check
+.Nd check a dashlock policy without confining anything
+.Sh SYNOPSIS
+.Nm
+.Op Fl k | Fl d
+.Op Fl l
+.Op Fl q
+.Op Fl n Ar narrow
+.Op Ar user
+.Nm
+.Fl V
+.Sh DESCRIPTION
+.Nm
+reports whether a
+.Xr dash 1
+confinement policy is well-formed and whether it would apply, so that an
+administrator can check a policy before it reaches a session instead of
+learning of a mistake from a broken login.
+It is built from the same source as the confining shell and runs the
+shell's own user-key resolution, policy lookup, trust checks on the policy
+path, parser, and pre-kernel checks of the enforcement backend, in the
+order the shell runs them.
+It stops before enforcement: no ruleset is created, no
+.Xr unveil 2
+or
+.Xr pledge 2
+call is made, and the invoking process is never confined.
+.Pp
+A refusal is the shell's own: the same message on standard error and the
+same exit status 78 that a session would produce for that policy.
+Running
+.Nm
+therefore reproduces a session refusal and yields the session's report.
+The trust checks on the policy path run as the invoking identity, so a run
+by root validates what root would receive and a run by an unprivileged
+account validates what that account would receive; the report states the
+identity it was made for.
+.Pp
+Without
+.Ar user ,
+the policy of the invoking account is checked.
+With
+.Ar user ,
+the policy that account would receive is checked, through the same lookup
+order.
+A
+.Ar user
+that is not a local account but is a usable policy key is accepted
+verbatim, so that a policy file can be checked before the account exists;
+the report says so.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl k
+Kernel mode.
+In addition to the structural checks, query the running Landlock ABI and
+report the derived required ABI, the explicit floor, the ceiling in force,
+and the kernel value, then apply the same ABI checks the session applies.
+The judgment holds for this kernel only; the report says so.
+On the unveil backend there is no version gate and the mode reports that.
+.It Fl d
+Dump mode.
+Print the normalized policy, one fact per line: the backend, the ABI floor
+and ceiling, the handled categories, the scope set, the pledge set, every
+path rule and port rule with its rights in a fixed order, and the derived
+required ABI.
+The output is deterministic, so two dumps can be compared with
+.Xr diff 1
+and a dump can be stored next to a policy as its reviewed meaning.
+With
+.Fl n ,
+the base policy and the narrowing policy are printed as two separate
+blocks; no intersection is computed, because only the kernel intersects
+layers.
+.It Fl l
+Emit advisory lints on standard error.
+Lints name omissions that read like permission bugs in a session, such as
+a library directory without read and execute, a loader cache that cannot
+be read, terminal devices without
+.Cm ioctl-dev ,
+a handled category without rules, or a home directory no rule covers.
+They are recommendations and never change the exit status.
+.It Fl q
+Quiet: print no success line; findings stay one per line.
+.It Fl n Ar narrow
+Also check the narrowing policy
+.Ar narrow ,
+exactly as a session started with
+.Fl -narrow
+would: on the Landlock backend it is located, trust-checked, parsed, and
+cross-checked after the base policy; on the unveil backend the request is
+refused before any policy file is read.
+.It Fl V
+Print the backend this binary enforces with and the configured policy
+directories, then exit.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds
+.It 0
+The policy would apply.
+.It 78
+The policy would not apply; the reason is on standard error, worded as the
+session would word it.
+.It 2
+Usage error.
+This is distinct from a refusal, so that a wrong command line is never
+mistaken for a policy problem.
+.El
+.Sh EXAMPLES
+Check the policy the account
+.Ql agent
+would receive, with lints:
+.Bd -literal -offset indent
+# dashlock-check -l agent
+.Ed
+.Pp
+Compare the meaning of a policy before and after an edit:
+.Bd -literal -offset indent
+# dashlock-check -d agent > before
+# vi /etc/dashlock/users/agent
+# dashlock-check -d agent | diff before -
+.Ed
+.Pp
+Gate a policy repository in continuous integration, one finding per line:
+.Bd -literal -offset indent
+$ dashlock-check -q -l template-account; echo $?
+.Ed
+.Sh SEE ALSO
+.Xr dash 1 ,
+.Xr landlock 7 ,
+.Xr pledge 2 ,
+.Xr unveil 2
+.Pp
+The DASHLOCK section of
+.Xr dash 1
+describes the policy format and the refusal messages.
+.Sh CAVEATS
+.Nm
+answers whether a policy is well-formed and applicable.
+It cannot show that a session under the policy can log in and work; that
+question belongs to a disposable session under the policy, probing the
+operations it is expected to allow and deny.

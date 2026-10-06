@@ -358,12 +358,18 @@ option exists.
 ## Test seam: recording wrappers
 
 The enforcement-sequence tests reuse the `#include "dashlock.c"` unit-driver
-pattern that the review compiles already use. The seam is the system-call
-wrapper layer, not the behavior functions: `dl_sys_create`, `dl_sys_add`,
-`dl_sys_restrict` on Landlock, and the `unveil`/`pledge` entry points on
-OpenBSD. A test build provides recording implementations of these that
-append each call and its arguments to a buffer and return success, instead
-of entering the kernel. The behavior code above them is then exercised
+pattern that the review compiles already use. The seam is three macros in
+`dashlock.c`, each defaulting to the libc entry point: `DL_SYSCALL` (the
+Landlock calls and `openat2`), `DL_FSTAT` (every `fstat` of the policy
+walk), and `DL_PRCTL`. A driver defines them before the include;
+`tests/t_sequence.c` routes `DL_SYSCALL` to a recorder that logs the Landlock
+calls, answers the version query with the ABI the scenario chooses, and
+passes `openat2` and everything else through to the real kernel, so rule
+paths are resolved for real while nothing is enforced. On OpenBSD the
+`unveil` and `pledge` functions themselves are the seam: a test driver
+defines recording versions (`tests/t_unveil.c`) or no-op versions
+(`tests/unveil_stubs.h`), which take precedence over libc's for that
+binary. The behavior code above them is then exercised
 unchanged, and the test asserts the recorded sequence: on Landlock, the
 attribute size per ABI branch, the handled masks after wildcard expansion,
 and that no restrict call follows a failed add; on unveil, that every rule
@@ -382,9 +388,15 @@ case.
 
 One trust-check case must not be written as a race. A file that grows
 between the size check and the end of the read is driven through the
-size-and-identity re-check path by a seam, not by racing a second process
-that appends while the reader runs, which would be nondeterministic in
-automation. A single genuine-race run stays a manual check.
+size-and-identity re-check path by the `DL_FSTAT` seam
+(`tests/t_trustseam.c`), not by racing a second process that appends while
+the reader runs, which would be nondeterministic in automation. The policy
+file is `fstat`ed twice on the regular-file descriptor, once in the verified
+open and once after the read to end of file, and the change detection
+compares the second size with the bytes actually read; the seam enlarges
+the second answer. The same driver fails the first `fstat` with `EIO` to
+show the errno survives the `close()` that precedes the refusal. A single
+genuine-race run stays a manual check.
 
 ## The policy checker: dashlock-check
 
@@ -393,11 +405,17 @@ provides its own `main`, so it links the shell's own `dl_user_key`,
 `dl_load` (lookup, trust checks, and `dl_parse`), `dl_required_abi`, and
 `dl_refuse`. One code motion inside `dashlock.c` makes the pre-kernel checks
 callable without confining: the pledge-directive refusal of
-enforce-policy-landlock step 1 moves into `dl_landlock_check()`, and steps 1
-to 4 of enforce-policy-unveil (the contract refusals and the class mapping)
-move into `dl_unveil_check()`; each apply function calls its check function
-first, unchanged in effect, and the checker calls them directly. Pure
-extraction, no semantic change, covered by the sequence tests. No sink abstraction is
+enforce-policy-landlock step 1 moves into `dl_landlock_check()`, its ABI
+checks (steps 3 and 4) into `dl_landlock_ceiling_check()` and
+`dl_landlock_required_check()`, two functions so that `dashlock_init` keeps
+the spec's order (both ceilings before either requirement) without
+repeating the conditions, and steps 1 to 4 of enforce-policy-unveil (the
+contract refusals and the class mapping) move into `dl_unveil_check()`;
+each apply path calls its check functions first, unchanged in effect, and
+the checker calls them directly. Pure extraction, no semantic change,
+covered by the sequence tests. The checker's command line is
+`dashlock-check [-k | -d] [-l] [-q] [-n narrow] [user]` and `-V`; the
+manual page `dashlock-check(8)` is normative for it. No sink abstraction is
 introduced: the write-and-exit refusal the shell uses is exactly what the
 checker wants, because validate and kernel modes report at most the one
 refusal a session would hit first. Dump mode runs after a successful parse,
@@ -444,10 +462,22 @@ hypervisor, the same sandbox the backend was first verified in.
 The build matrix: `--disable-dashlock` (must produce plain dash),
 `--enable-dashlock`, and `--disable-dashlock-name-gate`; a
 `--enable-dashlock` build on a host where `linux/landlock.h` is hidden must
-fail; gcc and clang with `-Wall -Wextra -Werror`; one parser build under the
-undefined-behavior and address sanitizers. The inertness check compares a
-`--disable-dashlock` build byte-for-byte against upstream dash 0.5.13.5 built
-from the same tarball with the same flags and a fixed `SOURCE_DATE_EPOCH`.
+fail; gcc and clang with `-Wall -Wextra -Werror` on the fork's objects
+only, passed as `make DASHLOCK_WARN_CFLAGS="-Wall -Wextra -Werror"`, since
+upstream dash does not build under `-Wextra` and its flags stay upstream's
+(the checker compiles `dashlock.c` through its include, so the shell's
+confinement code is covered); one build of the kernel-free layers under the
+undefined-behavior and address sanitizers. The inertness check
+(`tests/t_inertness.sh`) compares a `--disable-dashlock` build byte-for-byte
+against upstream dash 0.5.13.5 built from the same source with the same
+flags and a fixed `SOURCE_DATE_EPOCH`, taking upstream from `UPSTREAM_SRC`
+or from the "Release 0.5.13.5" commit in the fork's history; it passes only
+because `src/Makefile.am` links `dashlock.o` solely when the feature is
+built. The root-run layers (`t_trust.sh`, `t_kernel.sh`,
+`t_kernel_unveil.sh`) write under `/var/lib/dashlock-test` and the real
+policy directory for one test account, so they run only under
+`DASHLOCK_TESTS_SYSTEM=1` and report SKIP otherwise; `.github/workflows/ci.yml`
+sets it for the root job.
 
 A coverage-guided fuzzer over the parse path, seeded with the shipped
 policies, needs no change to the refusal paths when it is a forking fuzzer:

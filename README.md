@@ -102,6 +102,31 @@ deployments: installed under any name, it cannot be invoked without a policy.
 Where the confined party can choose the name it invokes the binary under, only
 this build is a boundary. See "Security model" below.
 
+The build also produces `dashlock-check`, which reports whether a policy is
+well-formed and would apply, with the session's own refusal message and exit
+status 78 when it would not, without confining anything; `dashlock-check -d`
+prints a normalized, diffable form of a policy and `-l` adds advisory lints.
+See `dashlock-check(8)`.
+
+### Tests
+
+```console
+$ make check
+$ sudo env DASHLOCK_TESTS_SYSTEM=1 make check   # adds the root-run layers
+```
+
+`make check` runs the kernel-free layers on any host: the parser and
+cross-check table (one row per negative example in the specification), the
+Landlock enforcement sequence through recording seams, and the unveil
+sequence with stub calls. With `DASHLOCK_TESTS_SYSTEM=1` as root it also runs
+the policy-file trust fixtures under `/var/lib/dashlock-test` and, on a kernel
+with Landlock (or on OpenBSD), a confined session for one unprivileged test
+account under the real policy directory. The inertness test builds the fork
+with the feature disabled and compares it byte for byte with upstream dash
+0.5.13.5 from the repository history. `.github/workflows/ci.yml` runs all of
+it, plus a build with the Landlock header hidden that must fail, a sanitizer
+build, and a bounded fuzzing run of the parser.
+
 ## Policy files
 
 Selected by the account name of the real user ID, first match wins:

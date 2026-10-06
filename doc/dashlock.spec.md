@@ -397,9 +397,11 @@ STEPS:
 1. Resolve and open path so that no component of it is a symbolic link and the
    final component is opened for reading only. If the file is genuinely absent,
    report "absent" so that the caller can try the next candidate. If a
-   component of a higher-priority path exists but is not a directory, that is a
-   broken or tampered hierarchy, not an absent file → refuse. On any other open
-   error → refuse with reason "cannot open <path>".
+   component of a higher-priority path exists but is not a directory, or a
+   component cannot be opened as a directory for any other reason, that is a
+   broken or tampered hierarchy, not an absent file → refuse with reason
+   "cannot open policy path <path>". On any other error opening the final
+   component → refuse with reason "cannot open <path>".
 2. Take every subsequent check from the open descriptor, never from the path
    string, so that the object checked is the object that was opened. On failure
    to read the descriptor's metadata → refuse with reason "cannot stat <path>".
@@ -445,7 +447,11 @@ POSTCONDITIONS:
   is a refusal
 
 ERRORS:
-- Refusal "cannot open <path>" for any open error other than ENOENT
+- Refusal "cannot open policy path <path>" when a component of the chain
+  cannot be opened as a directory, including a non-directory in a
+  higher-priority tree
+- Refusal "cannot open <path>" for any other open error on the final
+  component, other than ENOENT
 - Refusal "cannot stat <path>"
 - Refusal "<path> is not a regular file"
 - Refusal "<path> is not owned by root"
@@ -873,7 +879,7 @@ mode:      "validate" | "kernel" | "dump"   // default "validate"
 userkey:   the account whose policy to read  // default: the caller's own
 narrowkey: NarrowName | absent               // checked as the session would; dumped side by side
 lints:     boolean                           // emit advisory lints on stderr
-quiet:     boolean                           // machine-readable findings, one per line
+quiet:     boolean                           // no success line; findings stay one per line
 ```
 
 PRECONDITIONS:
@@ -1569,7 +1575,15 @@ against upstream 0.5.13.5. A test-suite deliverable is added. The confinement
 behaviors, the grammar, and the backend contract are unchanged from 0.6.0;
 this revision adds no directive and changes no refusal; the one change inside
 the shell's translation unit is a code motion that exposes each backend's
-pre-kernel checks to the checker. The assurance design was proposed by Vibe
+pre-kernel checks to the checker. Implementing it found two things, both
+recorded here: the component-walk refusal of open-and-validate-policy-file
+had no reason string in the specification although the shell has always
+worded it "cannot open policy path <path>", now stated; and a build with the
+feature disabled still linked an empty object, which made the inertness
+byte-identity claim false by one symbol, now linked only when the feature
+is built. The shell translation unit also gains three test seams
+(DL_SYSCALL, DL_FSTAT, DL_PRCTL), macros that default to the libc entry
+points and exist only for the test build. The assurance design was proposed by Vibe
 (Mistral AI) in the review of 2026-10-04 and amended as recorded in design.md
 section 8.
 
