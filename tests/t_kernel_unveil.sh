@@ -79,6 +79,6 @@ if [ -e "$ETC/users/default" ] || [ -e "$LIB/users/default" ]; then
 		echo "ok $n - default policy is found when the user file is missing (exit $rc)"
 	fi
 else
-	check "missing policy refuses with 78" 78 "no policy for user" as_user "$D" -c 'echo must-not-run'
+	check "missing policy refuses with 78" 78 "no policy for user" "$D" -c 'echo must-not-run'
 fi
 [ "$failed" = 0 ]
