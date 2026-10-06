@@ -132,15 +132,24 @@ final-file open both follow this.
 a refusal exits 78 rather than dying by signal when the launcher hands it a
 closed standard error. The shell installs its own disposition later.
 
-## abi-max
+## The ABI ceiling: DASHLOCK_ABI_KNOWN
 
-Optional ceiling directive. `abi_max` in `struct dl_policy` (0 = none, minimum
-wins across lines). Checked in `dashlock_init` after the ABI query: a running
-kernel above the ceiling exits 78. `abi-max` below `abi-min` is a parse-time
-contradiction. Its purpose is the wildcard-forward-compat gap: masking already
-prevents sending an unknown bit, so a wildcard cannot grant a future right, but
-it also cannot restrict one, and `abi-max` lets a wildcard policy refuse a
-kernel it has not been reviewed against.
+`DASHLOCK_ABI_KNOWN` is a configure-time constant (`--with-dashlock-abi-known`,
+default 6, the maximum `abi` field in the access-right tables; configure
+refuses a value below 1 or above that maximum, and a `#if` in `dashlock.c`
+refuses a header that disagrees with the tables). `dl_abi()` keeps answering
+with the kernel's version; a new `dl_effective_abi()` returns the smaller of
+that and the constant, and everything that used the kernel value for policy
+purposes uses the effective value instead: `dl_mask()` for the wildcard
+expansion, the attribute size branch in `dl_apply()`, and the required-ABI
+comparison. The required-ABI refusal names the bound that was hit: the kernel
+when its version is the smaller value, the build otherwise ("this build knows
+<c>"). Capping is safe because `landlock_create_ruleset` reads the attribute
+by the size passed, so a ruleset built for ABI e behaves on a newer kernel as
+on ABI e. The `abi_max` field, its parse, and `dl_landlock_ceiling_check()`
+go away; `abi-max` in a policy file is then an unknown directive and refuses
+at parse time, which is the loud failure the design prefers to a silent
+no-op.
 
 ## errno discipline
 
@@ -201,6 +210,7 @@ rules, raise the constant and rebuild.
 | `--with-dashlock-name=NAME` | `dashlock` | trigger name |
 | `--with-dashlock-etcdir=DIR` | `/etc/dashlock` | admin policy dir, must be absolute |
 | `--with-dashlock-libdir=DIR` | `/usr/lib/dashlock` | vendor policy dir, must be absolute |
+| `--with-dashlock-abi-known=N` | 6, the tables' maximum | ceiling of the effective ABI; refused outside 1..6 |
 
 `dashlock.c` also compiles standalone for review: the config macros have
 in-file defaults under `#ifndef`, and unit drivers `#include "dashlock.c"`
@@ -405,11 +415,9 @@ provides its own `main`, so it links the shell's own `dl_user_key`,
 `dl_load` (lookup, trust checks, and `dl_parse`), `dl_required_abi`, and
 `dl_refuse`. One code motion inside `dashlock.c` makes the pre-kernel checks
 callable without confining: the pledge-directive refusal of
-enforce-policy-landlock step 1 moves into `dl_landlock_check()`, its ABI
-checks (steps 3 and 4) into `dl_landlock_ceiling_check()` and
-`dl_landlock_required_check()`, two functions so that `dashlock_init` keeps
-the spec's order (both ceilings before either requirement) without
-repeating the conditions, and steps 1 to 4 of enforce-policy-unveil (the
+enforce-policy-landlock step 1 moves into `dl_landlock_check()`, its
+required-ABI check (step 4, against the effective ABI) into
+`dl_landlock_required_check()`, and steps 1 to 4 of enforce-policy-unveil (the
 contract refusals and the class mapping) move into `dl_unveil_check()`;
 each apply path calls its check functions first, unchanged in effect, and
 the checker calls them directly. Pure extraction, no semantic change,
@@ -453,7 +461,7 @@ The parser, cross-check, and sequence tests run on any host. The
 confinement and ABI-refusal tests need a kernel the test build controls, which a hosted runner does not
 provide. A virtual machine with a pinned kernel and
 controlled boot parameters is the deterministic option: it boots kernels on
-both sides of a policy's ABI to exercise `abi-min` and `abi-max` refusal in
+both sides of a policy's requirement to exercise the `abi-min` refusal and the build ceiling in
 both directions, and boots with Landlock removed from the LSM list to
 exercise the unavailable-kernel path. The OpenBSD leg has no hosted runner
 either; it runs in a local virtual machine under the platform's own

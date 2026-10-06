@@ -4,7 +4,7 @@
 
 Deployment:   enhance-existing
 Language:     any
-Version:      0.7.0
+Version:      0.8.0
 Spec-Schema:  0.4.0
 Hints-file:   dashlock.c.hints.md
 Author:       Matthias G. Eckermann
@@ -65,6 +65,15 @@ PolicyPath := string where non-empty
 AbiVersion := integer where value >= 1
   // Landlock ABI version. The running value is obtained from the kernel; a
   // required value is computed from a Policy.
+
+AbiKnown := AbiVersion
+  // The highest Landlock ABI version this build's access-right tables cover,
+  // fixed at build time: DASHLOCK_ABI_KNOWN, set by configure
+  // --with-dashlock-abi-known, defaulting to the tables' own maximum and
+  // never above it. The effective ABI of a session is the smaller of the
+  // running kernel's version and AbiKnown, and it caps every wildcard
+  // expansion. A ceiling is a property of what the binary knows, not of a
+  // policy, which is why it is a build constant and not a directive.
 
 FsAccessName := "execute" | "write-file" | "read-file" | "read-dir"
              | "remove-dir" | "remove-file" | "make-char" | "make-dir"
@@ -131,7 +140,6 @@ Policy := {
   pathRules:  PathRule[],
   netRules:   NetRule[],
   abiFloor:   AbiVersion,
-  abiCeiling: AbiVersion | none,
   pledged:    set of PledgeName | none
 }
   // pledged is none when the policy contains no pledge directive; the unveil
@@ -139,23 +147,19 @@ Policy := {
   // empty set is not constructible: a pledge directive with no names is
   // refused at parse time.
   //
-  // abiFloor and abiCeiling are precondition values for the landlock
-  // backend; the unveil backend records and ignores them, per the
-  // enforce-policy contract.
+  // abiFloor is a precondition value for the landlock backend; the unveil
+  // backend records and ignores it, per the enforce-policy contract.
   //
   // abiFloor is the explicit floor from an abi-min directive, defaulting to 1.
   // The effective requirement is computed by compute-required-abi and is
   // always at least as high as abiFloor.
   //
-  // abiCeiling is the optional cap from an abi-max directive. When set, a
-  // running kernel whose ABI exceeds it is refused. Its purpose is the
-  // wildcard categories: "access fs" handles every right the implementation
-  // knows, so on a newer kernel with an unknown right the wildcard would
-  // leave that right unhandled and therefore unrestricted; an author using a
-  // wildcard sets abiCeiling to the newest ABI they reviewed. abiCeiling
-  // below abiFloor is a contradiction and is refused. Every shipped example
-  // policy that uses a wildcard sets abiCeiling, because an example is what
-  // gets copied.
+  // There is no policy-level ceiling. A wildcard category handles every
+  // right the build knows, capped by AbiKnown at enforcement time; a kernel
+  // newer than the build changes nothing, because Landlock treats a ruleset
+  // created with an older attribute layout exactly as that older ABI would.
+  // A policy that must mean the same across builds with different tables
+  // lists its rights explicitly instead of using the wildcard.
 
 Refusal := {
   reason: string where non-empty
@@ -491,14 +495,12 @@ STEPS:
    and 255; on failure → refuse with reason "invalid abi-min in <source>".
    Record the maximum of it and the current abiFloor: with several abi-min
    lines the highest wins, so a later line cannot lower an earlier floor.
-   If the keyword is "abi-max": parse the rest the same way; on failure →
-   refuse with reason "invalid abi-max in <source>". Record the minimum of it
-   and the current abiCeiling: with several abi-max lines the lowest wins.
 5. If the keyword is "access": if the rest is "fs", request the filesystem
    wildcard, which handles every FsAccessName this implementation knows,
    intersected at enforcement time with those the running kernel supports.
    The wildcard cannot handle a right introduced after the implementation was
-   written, which is what abi-max exists to guard. If the rest starts with
+   written; enforcement caps the expansion at AbiKnown, so a newer kernel
+   never widens it (enforce-policy-landlock, step 3). If the rest starts with
    "fs:", add each named right in the comma-separated remainder to handledFs.
    If the rest is "net-tcp", add both NetAccessName values to handledNet. If
    the rest starts with "net-tcp:", add each named right to handledNet. On any
@@ -536,8 +538,7 @@ STEPS:
    <source>".
 10. After all lines: if handledFs and handledNet are both empty, scoped is
     empty, and neither wildcard category was requested → refuse with reason
-    "<source> handles no access". If abiCeiling is set and is below abiFloor →
-    refuse with reason "abi-max below abi-min in <source>".
+    "<source> handles no access".
 11. Unless the filesystem wildcard category was requested: for every PathRule
     whose access set is not contained in handledFs → refuse with reason
     "rule for <path> uses access not handled in <source>". A rule granting an
@@ -568,8 +569,6 @@ POSTCONDITIONS:
 
 ERRORS:
 - Refusal "invalid abi-min in <source>"
-- Refusal "invalid abi-max in <source>"
-- Refusal "abi-max below abi-min in <source>"
 - Refusal "unknown access name <name> in <source>"
 - Refusal "unknown scope name <name> in <source>"
 - Refusal "pledge without promises in <source>"
@@ -641,16 +640,16 @@ the OpenBSD unveil and pledge system calls are. One policy grammar and one
 parser serve every backend; what differs is enforcement, and it is bound by
 three rules. First, a restriction directive the backend cannot enforce is a
 refusal, never a skip. Second, a precondition directive that does not apply
-to the backend is ignored; abi-min and abi-max gate the Landlock version
-ladder and gate nothing elsewhere, and every feature they would guard on the
-Landlock backend is already covered by the first rule. Third, access mapping
+to the backend is ignored; abi-min gates the Landlock version ladder and
+gates nothing elsewhere, and every feature it would guard on the Landlock
+backend is already covered by the first rule. Third, access mapping
 may coarsen toward more denial, never toward less.
 
 Directive applicability, normative for every backend:
 
 | Directive | landlock backend | unveil backend |
 | --- | --- | --- |
-| `abi-min`, `abi-max` | version gate | ignored, nothing to gate |
+| `abi-min` | version gate | ignored, nothing to gate |
 | `access fs` (wildcard) | enforced | enforced |
 | `access fs:<subset>` | enforced | refused: unveil governs all four classes at once |
 | `access net-tcp`, `rule net-port` | enforced | refused |
@@ -711,17 +710,22 @@ STEPS:
 2. Query the running Landlock ABI version from the kernel. On failure →
    refuse with reason "landlock unavailable: enable it in CONFIG_LSM or the
    lsm= boot parameter".
-3. If base has an abiCeiling and the running version exceeds it → refuse
-   with reason "kernel landlock ABI <m> exceeds policy abi-max <n>". Repeat
-   for narrow when present.
-4. Call compute-required-abi for base; if the running version is lower →
-   refuse with reason "policy needs landlock ABI <n>, kernel provides <m>".
-   If narrow is present, repeat for it.
+3. Compute the effective ABI as the smaller of the running version and
+   AbiKnown. A kernel newer than the build is not a refusal: Landlock reads a
+   ruleset attribute by the size the caller passes, so a ruleset created
+   with the effective ABI's layout behaves on the newer kernel exactly as it
+   would on a kernel of that ABI, and rights the build does not know stay
+   unhandled, which is the behavior the policy author reviewed.
+4. Call compute-required-abi for base; if the requirement exceeds the
+   effective ABI → refuse: with reason "policy needs landlock ABI <n>,
+   kernel provides <m>" when the running version is the smaller value, and
+   with reason "policy needs landlock ABI <n>, this build knows <c>" when
+   AbiKnown is. If narrow is present, repeat for it.
 5. Set PR_SET_NO_NEW_PRIVS to 1. On failure → refuse with reason "cannot set
    no_new_privs".
 6. Apply base: create a ruleset whose handled access is the policy's handled
-   sets masked to the rights the running ABI supports, and whose attribute
-   size matches the running ABI. On failure → refuse with reason "cannot
+   sets masked to the rights the effective ABI supports, and whose attribute
+   size matches the effective ABI. On failure → refuse with reason "cannot
    create ruleset".
 7. For every PathRule: open the path as a resolvable handle without following
    any symbolic-link component, since a root-authored policy commonly names a
@@ -745,8 +749,8 @@ POSTCONDITIONS:
 ERRORS:
 - Refusal "backend cannot enforce pledge in <source>"
 - Refusal "landlock unavailable: enable it in CONFIG_LSM or the lsm= boot parameter"
-- Refusal "kernel landlock ABI <m> exceeds policy abi-max <n>"
 - Refusal "policy needs landlock ABI <n>, kernel provides <m>"
+- Refusal "policy needs landlock ABI <n>, this build knows <c>"
 - Refusal "cannot set no_new_privs"
 - Refusal "cannot create ruleset"
 - Refusal "cannot open rule path <path>"
@@ -909,8 +913,9 @@ STEPS:
    check. Any refusal is reported with exit 78.
 6. In kernel mode, additionally query the running Landlock ABI the way
    enforce-policy-landlock does, and report the derived required ABI, the
-   explicit floor, the ceiling in force, and the running kernel's ABI, with
-   a statement that the judgment is for this kernel only.
+   explicit floor, the build's AbiKnown, the running kernel's ABI and the
+   effective ABI, then apply the same check as enforce-policy-landlock
+   step 4, with a statement that the judgment is for this kernel only.
 7. In dump mode, print the normalized policy: handled rights per category,
    each PathRule with its rights, each NetRule, the scope set, the pledge
    set, and the derived required ABI. When narrowkey is present, print the
@@ -1054,6 +1059,8 @@ Environment conditions:
 - [observable]  A policy containing an unknown directive is refused rather than partially applied
 - [observable]  On the landlock backend, a policy that uses scoping is refused on a kernel below ABI 6
 - [observable]  On the landlock backend, a policy stating the network wildcard category is refused on a kernel below ABI 4, never applied with the network portion silently dropped
+- [observable]  On the landlock backend, a kernel whose ABI exceeds AbiKnown never causes a refusal by itself; the session applies with the effective ABI's layout
+- [implementation]  A wildcard category never expands beyond the rights the build knows, whatever the running kernel reports
 - [observable]  A rule requesting bind on an ephemeral port (port 0) is accepted; port 0 with connect is refused
 - [implementation]  No code path exists that applies a subset of a policy and continues
 - [implementation]  No environment variable influences whether or how the policy is applied
@@ -1173,6 +1180,31 @@ THEN:
   refuse is called with reason "policy needs landlock ABI 6, kernel provides 3"
   exit code is 78
   the policy is not applied with the scoping silently dropped
+
+### EXAMPLE: newer_kernel_applies_with_the_build_ceiling
+GIVEN:
+  the landlock backend, a build with AbiKnown 6
+  a kernel with Landlock ABI version 7
+  the shipped default policy, which uses the filesystem wildcard
+WHEN:
+  enforce-policy-landlock runs
+THEN:
+  the effective ABI is 6
+  the ruleset is created with the ABI 6 attribute layout and the sixteen
+    rights the build knows; nothing the kernel added in ABI 7 is handled
+  the session starts; no refusal is produced by the newer kernel alone
+
+### EXAMPLE: build_ceiling_below_requirement_refuses
+GIVEN:
+  the landlock backend, a build configured with --with-dashlock-abi-known=4
+  a kernel with Landlock ABI version 6
+  a policy containing "scope signal", which needs ABI 6
+WHEN:
+  enforce-policy-landlock runs
+THEN:
+  the effective ABI is 4, bounded by the build and not by the kernel
+  refuse is called with reason "policy needs landlock ABI 6, this build knows 4"
+  exit code is 78
 
 ### EXAMPLE: landlock_not_enabled_refuses
 GIVEN:
@@ -1388,8 +1420,9 @@ GIVEN:
 WHEN:
   dashlock-check is run in kernel mode for user agent
 THEN:
-  the report states required ABI 6, the policy floor, the ceiling in force,
-    kernel ABI 4, and that the judgment holds for this kernel only
+  the report states required ABI 6, the policy floor, the build's AbiKnown,
+    kernel ABI 4, effective ABI 4, and that the judgment holds for this
+    kernel only
   refuse is called with reason "policy needs landlock ABI 6, kernel provides 4"
   exit code is 78, the same the session would produce here
 
@@ -1468,7 +1501,8 @@ COMPONENT: policy-examples
            vendor directory
   required: true
   note: The default policy is backend-specific and the build installs the
-        variant matching its backend under the name "default". The narrowing
+        variant matching its backend under the name "default". No shipped
+        policy carries a ceiling: the ceiling is the build's. The narrowing
         example is installed on the landlock backend only; the unveil backend
         refuses --narrow.
 
@@ -1548,6 +1582,7 @@ Build-time options:
 | `--with-dashlock-name=NAME` | `dashlock` | trigger name |
 | `--with-dashlock-etcdir=DIR` | `/etc/dashlock` | administrator policy directory |
 | `--with-dashlock-libdir=DIR` | `/usr/lib/dashlock` | vendor policy directory |
+| `--with-dashlock-abi-known=N` | the tables' maximum (6) | AbiKnown: cap the effective ABI at N; refused below 1 or above the tables' maximum |
 
 `--disable-dashlock-name-gate` produces the build for the strictest
 deployments: installed under any name, it cannot be invoked without a policy.
@@ -1555,6 +1590,31 @@ Whether the gate applies is a property of the binary, not of its runtime
 environment.
 
 ## DELTA
+
+Version 0.8.0 moves the Landlock ABI ceiling out of the policy file and into
+the binary. The abi-max directive is removed from the grammar, so a policy
+that still carries one is refused as an unknown directive, loudly and at
+parse time; abi-min stays, because a floor is a legitimate statement for a
+policy author to make. The ceiling becomes AbiKnown, a build constant
+(DASHLOCK_ABI_KNOWN, configure --with-dashlock-abi-known, defaulting to the
+access-right tables' own maximum), and a session's effective ABI is the
+smaller of the kernel's and AbiKnown. Three reasons, recorded here. First,
+the ceiling guards the wildcard categories against rights the build does not
+know, and what the build knows is a property of the build, not of any policy;
+putting it in every policy file made every author restate a fact about the
+binary. Second, capping is safe where refusing was defensive: Landlock reads a
+ruleset attribute by the size the caller passes, so a ruleset created with the
+effective ABI's layout behaves on a newer kernel exactly as on a kernel of
+that ABI, and nothing the policy author reviewed changes. Third, the
+operational failure the old scheme produced was the wrong one: the first
+kernel update reporting ABI 7 refused every session under the shipped
+default with "kernel landlock ABI 7 exceeds policy abi-max 6", observed on a
+6.18 test kernel, locking out every confined account over a configuration
+that had not changed. A policy that must mean the same across builds with
+different tables lists its rights explicitly instead of using the wildcard.
+The required-ABI refusal now names which bound was hit, the kernel or the
+build; the checker's kernel mode reports both bounds and the effective ABI;
+the shipped policies carry no ceiling.
 
 Version 0.7.0 adds assurance; the confinement behavior is unchanged. It
 introduces validate-policy,
