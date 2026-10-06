@@ -11,3 +11,4 @@ nodes.[ch]
 signames.c
 syntax.[ch]
 token.h
+dashlock-check

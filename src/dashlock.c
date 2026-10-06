@@ -129,6 +129,22 @@
 #include <sys/syscall.h>
 #endif
 
+/*
+ * Test seams.  A unit driver that includes this file may define these
+ * before the include to record or redirect the kernel entry points (see
+ * the hints file, "Test seam").  The shell build takes the defaults, which
+ * are the plain libc entry points, so the shell binary contains no seam.
+ */
+#ifndef DL_SYSCALL
+#define DL_SYSCALL syscall
+#endif
+#ifndef DL_FSTAT
+#define DL_FSTAT fstat
+#endif
+#ifndef DL_PRCTL
+#define DL_PRCTL prctl
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Access-right bit representation, common to every backend            */
 /* ------------------------------------------------------------------ */
@@ -225,7 +241,7 @@ static long
 dl_sys_openat2(int dirfd, const char *path, struct dl_open_how *how,
 	       size_t size)
 {
-	return syscall(__NR_openat2, dirfd, path, how, size);
+	return DL_SYSCALL(__NR_openat2, dirfd, path, how, size);
 }
 
 #ifndef O_PATH
@@ -256,19 +272,19 @@ struct dl_net_port_attr {
 static long
 dl_sys_create(const void *attr, size_t size, uint32_t flags)
 {
-	return syscall(__NR_landlock_create_ruleset, attr, size, flags);
+	return DL_SYSCALL(__NR_landlock_create_ruleset, attr, size, flags);
 }
 
 static long
 dl_sys_add(int fd, int type, const void *attr, uint32_t flags)
 {
-	return syscall(__NR_landlock_add_rule, fd, type, attr, flags);
+	return DL_SYSCALL(__NR_landlock_add_rule, fd, type, attr, flags);
 }
 
 static long
 dl_sys_restrict(int fd, uint32_t flags)
 {
-	return syscall(__NR_landlock_restrict_self, fd, flags);
+	return DL_SYSCALL(__NR_landlock_restrict_self, fd, flags);
 }
 
 #endif /* DASHLOCK_BACKEND_LANDLOCK */
@@ -659,7 +675,7 @@ dl_open_verified(const char *path, struct stat *stp)
 	dirfd = open("/", DL_WALK_FLAGS);
 	if (dirfd < 0)
 		dl_refuse_errno("cannot open / for ", path, errno);
-	if (fstat(dirfd, &st) != 0) {
+	if (DL_FSTAT(dirfd, &st) != 0) {
 		int err = errno;
 
 		close(dirfd);
@@ -704,7 +720,7 @@ dl_open_verified(const char *path, struct stat *stp)
 			dl_refuse_errno("cannot open policy path ", path, err);
 		}
 		dirfd = nextfd;
-		if (fstat(dirfd, &st) != 0) {
+		if (DL_FSTAT(dirfd, &st) != 0) {
 			err = errno;
 			close(dirfd);
 			dl_refuse_errno("cannot stat policy path ", path, err);
@@ -735,7 +751,7 @@ dl_open_verified(const char *path, struct stat *stp)
 			dl_refuse_errno("cannot open ", path, err);
 		}
 	}
-	if (fstat(fd, stp) != 0) {
+	if (DL_FSTAT(fd, stp) != 0) {
 		int err = errno;
 
 		close(fd);
@@ -814,7 +830,7 @@ dl_read_policy_file(const char *path)
 	 * partially written policy.  Policy updates must be atomic: write a
 	 * new root-owned file and rename it into place.
 	 */
-	if (fstat(fd, &st2) != 0) {
+	if (DL_FSTAT(fd, &st2) != 0) {
 		int err = errno;
 
 		close(fd);
@@ -1325,6 +1341,66 @@ dl_load(struct dl_policy *pol, const char *key, int is_narrow)
 /* BEHAVIOR/INTERNAL: enforce-policy-landlock                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Step 1 of enforce-policy-landlock, the backend contract: the pledge
+ * directive is a restriction this backend cannot enforce, and refusing
+ * keeps the policy's meaning identical on both backends.  Kept apart so
+ * that the policy checker can run exactly this check without confining.
+ * narrow is NULL when no narrowing policy was requested.
+ */
+static void
+dl_landlock_check(const struct dl_policy *base, const struct dl_policy *narrow)
+{
+	if (base->have_pledge)
+		dl_refuse("backend cannot enforce pledge in ",
+			  base->source, "");
+	if (narrow != NULL && narrow->have_pledge)
+		dl_refuse("backend cannot enforce pledge in ",
+			  narrow->source, "");
+}
+
+/*
+ * Steps 3 and 4 of enforce-policy-landlock, one policy against the running
+ * ABI: the ceiling from abi-max, and the derived requirement.  Two
+ * functions, so that the caller keeps the spec's order (both ceilings
+ * before either requirement) without repeating the conditions.  Kept apart
+ * for the same reason as dl_landlock_check; the checker's kernel mode runs
+ * exactly these against the queried ABI.
+ */
+static void
+dl_landlock_ceiling_check(const struct dl_policy *pol, int abi)
+{
+	if (pol->abi_max != 0 && abi > pol->abi_max) {
+		char cap[16], have[16];
+
+		dl_utoa((unsigned long)pol->abi_max, cap, sizeof(cap));
+		dl_utoa((unsigned long)abi, have, sizeof(have));
+		dl_write("dashlock: kernel landlock ABI ");
+		dl_write(have);
+		dl_write(" exceeds policy abi-max ");
+		dl_write(cap);
+		dl_write("\n");
+		_exit(DASHLOCK_EXIT_CONFIG);
+	}
+}
+
+static void
+dl_landlock_required_check(const struct dl_policy *pol, int abi)
+{
+	if (dl_required_abi(pol) > abi) {
+		char need[16], have[16];
+
+		dl_utoa((unsigned long)dl_required_abi(pol), need, sizeof(need));
+		dl_utoa((unsigned long)abi, have, sizeof(have));
+		dl_write("dashlock: policy needs landlock ABI ");
+		dl_write(need);
+		dl_write(", kernel provides ");
+		dl_write(have);
+		dl_write("\n");
+		_exit(DASHLOCK_EXIT_CONFIG);
+	}
+}
+
 static void
 dl_apply(const struct dl_policy *pol)
 {
@@ -1573,16 +1649,14 @@ dl_uv_verify(const char *path, struct dl_uv_slot *slot)
 }
 
 /*
- * The enforcement sequence of the spec, steps 1 to 10 in order.  The
- * unveil set and its lock survive execve only while execution promises
- * are in force, so both are installed here, before the shell reads
- * anything.
+ * Steps 1 to 4 of enforce-policy-unveil: the backend contract and the
+ * class mapping, everything that refuses before a descriptor is opened.
+ * Kept apart from the apply function so that the policy checker can run
+ * exactly these checks without confining; dl_unveil_apply calls it first.
  */
 static void
-dl_unveil_apply(const struct dl_policy *pol)
+dl_unveil_check(const struct dl_policy *pol)
 {
-	char promises[DL_PLEDGE_MAX];
-	int saved;
 	int i;
 
 	/*
@@ -1626,6 +1700,22 @@ dl_unveil_apply(const struct dl_policy *pol)
 			dl_refusev(parts);
 		}
 	}
+}
+
+/*
+ * The enforcement sequence of the spec, steps 1 to 10 in order.  The
+ * unveil set and its lock survive execve only while execution promises
+ * are in force, so both are installed here, before the shell reads
+ * anything.
+ */
+static void
+dl_unveil_apply(const struct dl_policy *pol)
+{
+	char promises[DL_PLEDGE_MAX];
+	int saved;
+	int i;
+
+	dl_unveil_check(pol);
 
 	saved = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (saved < 0)
@@ -1935,71 +2025,17 @@ dashlock_init(int *argcp, char **argv)
 		dl_load(&narrow, narrow_name, 1);
 
 #ifdef DASHLOCK_BACKEND_LANDLOCK
-	/*
-	 * Backend contract, rule 1: the pledge directive is a restriction
-	 * this backend cannot enforce; refusing keeps the policy's meaning
-	 * identical on both backends.
-	 */
-	if (base.have_pledge)
-		dl_refuse("backend cannot enforce pledge in ",
-			  base.source, "");
-	if (narrow_name != NULL && narrow.have_pledge)
-		dl_refuse("backend cannot enforce pledge in ",
-			  narrow.source, "");
+	dl_landlock_check(&base, narrow_name != NULL ? &narrow : NULL);
 
 	abi = dl_abi();
-	if (base.abi_max != 0 && abi > base.abi_max) {
-		char cap[16], have[16];
+	dl_landlock_ceiling_check(&base, abi);
+	if (narrow_name != NULL)
+		dl_landlock_ceiling_check(&narrow, abi);
+	dl_landlock_required_check(&base, abi);
+	if (narrow_name != NULL)
+		dl_landlock_required_check(&narrow, abi);
 
-		dl_utoa((unsigned long)base.abi_max, cap, sizeof(cap));
-		dl_utoa((unsigned long)abi, have, sizeof(have));
-		dl_write("dashlock: kernel landlock ABI ");
-		dl_write(have);
-		dl_write(" exceeds policy abi-max ");
-		dl_write(cap);
-		dl_write("\n");
-		_exit(DASHLOCK_EXIT_CONFIG);
-	}
-	if (narrow_name != NULL && narrow.abi_max != 0 && abi > narrow.abi_max) {
-		char cap[16], have[16];
-
-		dl_utoa((unsigned long)narrow.abi_max, cap, sizeof(cap));
-		dl_utoa((unsigned long)abi, have, sizeof(have));
-		dl_write("dashlock: kernel landlock ABI ");
-		dl_write(have);
-		dl_write(" exceeds policy abi-max ");
-		dl_write(cap);
-		dl_write("\n");
-		_exit(DASHLOCK_EXIT_CONFIG);
-	}
-	if (dl_required_abi(&base) > abi) {
-		char need[16], have[16];
-
-		dl_utoa((unsigned long)dl_required_abi(&base), need,
-			sizeof(need));
-		dl_utoa((unsigned long)abi, have, sizeof(have));
-		dl_write("dashlock: policy needs landlock ABI ");
-		dl_write(need);
-		dl_write(", kernel provides ");
-		dl_write(have);
-		dl_write("\n");
-		_exit(DASHLOCK_EXIT_CONFIG);
-	}
-	if (narrow_name != NULL && dl_required_abi(&narrow) > abi) {
-		char need[16], have[16];
-
-		dl_utoa((unsigned long)dl_required_abi(&narrow), need,
-			sizeof(need));
-		dl_utoa((unsigned long)abi, have, sizeof(have));
-		dl_write("dashlock: policy needs landlock ABI ");
-		dl_write(need);
-		dl_write(", kernel provides ");
-		dl_write(have);
-		dl_write("\n");
-		_exit(DASHLOCK_EXIT_CONFIG);
-	}
-
-	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+	if (DL_PRCTL(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
 		dl_refuse_errno("cannot set no_new_privs", NULL, errno);
 
 	dl_apply(&base);

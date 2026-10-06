@@ -1,0 +1,9 @@
+*.o
+*.log
+*.trs
+t_parse
+t_unveil
+t_sequence
+t_check
+t_trustseam
+fuzz_parse

@@ -1,0 +1,121 @@
+# dashlock continuous integration (dashlock.spec.md, DELIVERABLES:
+# continuous-integration; design.md section 8.3).
+#
+# Hosted runners cover the host-independent layers and the root-run trust
+# fixtures.  The on-kernel layer runs here too when the runner kernel has
+# Landlock (ubuntu-24.04 ships 6.8 with landlock in the LSM list); the ABI
+# refusal paths in both directions and the unavailable-kernel path need a
+# VM with a pinned kernel and controlled boot parameters, which a hosted
+# runner does not give, and the OpenBSD leg needs an OpenBSD host.  Both
+# are left as self-hosted jobs, declared at the bottom and disabled until
+# such a runner exists.
+
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-matrix:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        configure:
+          - --enable-dashlock
+          - --disable-dashlock
+          - --enable-dashlock --disable-dashlock-name-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the inertness test needs the upstream release commit
+      - run: sudo apt-get install -y -q autoconf automake ${{ matrix.cc }}
+      - run: autoreconf -fi
+      - run: ./configure ${{ matrix.configure }} CC=${{ matrix.cc }}
+      - run: make -j4 DASHLOCK_WARN_CFLAGS="-Wall -Wextra -Werror"
+      # the host-independent layers, as the unprivileged runner user
+      - run: make check DASHLOCK_WARN_CFLAGS="-Wall -Wextra -Werror"
+      - if: failure()
+        run: cat tests/test-suite.log
+
+  fail-the-build-contract:
+    # --enable-dashlock with no backend must fail configure, not fall back
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -q autoconf automake
+      - run: autoreconf -fi
+      - run: |
+          mkdir -p hidden/linux
+          echo '#error hidden for the fail-the-build test' > hidden/linux/landlock.h
+          if ./configure --enable-dashlock CPPFLAGS="-I$PWD/hidden"; then
+            echo "configure succeeded without a backend"; exit 1
+          fi
+          grep -q 'requires linux/landlock.h or unveil/pledge' config.log
+
+  system-tests:
+    # Layers 3 and 4: trust fixtures and the confined session, as root
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get install -y -q autoconf automake
+      - run: autoreconf -fi
+      - run: ./configure --enable-dashlock
+      - run: make -j4 DASHLOCK_WARN_CFLAGS="-Wall -Wextra -Werror"
+      - run: sudo env DASHLOCK_TESTS_SYSTEM=1 make check
+      - if: failure()
+        run: sudo cat tests/test-suite.log tests/t_trust.sh.log tests/t_kernel.sh.log
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -q autoconf automake clang
+      - run: autoreconf -fi
+      - run: >
+          ./configure --enable-dashlock CC=clang
+          CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+          LDFLAGS="-fsanitize=address,undefined"
+      - run: make -j4
+      - run: ASAN_OPTIONS=detect_leaks=0 make check TESTS='t_parse t_unveil t_sequence'
+      - if: failure()
+        run: cat tests/test-suite.log
+
+  fuzz-smoke:
+    # a bounded run of the forking fuzz driver on every push; the long
+    # scheduled run is the same job with a longer -V
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -q autoconf automake afl++
+      - run: autoreconf -fi
+      - run: ./configure --enable-dashlock CC=afl-clang-fast
+      - run: make -j4 && make -C tests fuzz_parse CC=afl-clang-fast
+      - run: |
+          cd tests
+          mkdir seeds && cp ../policy/users/default ../policy/users/default.unveil ../policy/narrow/readonly seeds/
+          AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
+            afl-fuzz -V 120 -i seeds -o findings -- ./fuzz_parse @@ > afl.log 2>&1 || true
+          ls findings/default/crashes/ 2>/dev/null | grep -v README && { echo "crashes found"; exit 1; } || echo "no crashes"
+
+  # Self-hosted legs, enabled once a runner with the label exists:
+  # kernel-vm boots pinned kernels on both sides of the policy ABI and one
+  # with landlock removed from the LSM list; openbsd runs the suite on an
+  # OpenBSD 7.9 host under DASHLOCK_TESTS_SYSTEM=1.
+  kernel-vm:
+    if: false
+    runs-on: [self-hosted, dashlock-kernel-vm]
+    steps:
+      - uses: actions/checkout@v4
+      - run: autoreconf -fi && ./configure --enable-dashlock && make -j4
+      - run: sudo env DASHLOCK_TESTS_SYSTEM=1 make check
+  openbsd:
+    if: false
+    runs-on: [self-hosted, dashlock-openbsd]
+    steps:
+      - uses: actions/checkout@v4
+      - run: autoreconf -fi && ./configure --enable-dashlock && gmake -j4
+      - run: doas env DASHLOCK_TESTS_SYSTEM=1 gmake check

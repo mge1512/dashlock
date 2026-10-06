@@ -347,5 +347,5 @@ AM_CONDITIONAL([BUILD_DASHLOCK_UNVEIL], [test "$dashlock_backend" = "unveil"])
 AC_SUBST([DASHLOCK_ETCDIR], [$with_dashlock_etcdir])
 AC_SUBST([DASHLOCK_LIBDIR], [$with_dashlock_libdir])
 
-AC_CONFIG_FILES([Makefile src/Makefile policy/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile policy/Makefile tests/Makefile])
 AC_OUTPUT

@@ -614,7 +614,9 @@ cover the option-parsing paths around the `--narrow` consumption, the only
 point where the fork touches argv before the shell starts. The baseline is
 upstream 0.5.13.5, not dash master, because comparing against master would
 measure upstream's drift since the fork point rather than anything about the
-fork.
+fork. Making the comparison pass took one change: a disabled build still
+linked an empty `dashlock.o`, visible as one file symbol in the symbol
+table, so the object is now linked only when the feature is built.
 
 ### 8.3 Build matrix and the parser as attack surface
 
@@ -622,7 +624,9 @@ The configurations that must be built: `--disable-dashlock` (produces plain
 dash), `--enable-dashlock`, and `--disable-dashlock-name-gate`. A build with
 `--enable-dashlock` on a host where `linux/landlock.h` has been hidden must
 fail, which is the fail-the-build contract made executable. Compilers are gcc
-and clang with `-Wall -Wextra -Werror`, and one parser build runs under the
+and clang with `-Wall -Wextra -Werror` on the fork's own objects (upstream
+dash does not build under `-Wextra`, and its flags are not the fork's to
+change), and one build of the kernel-free layers runs under the
 undefined-behavior and address sanitizers.
 
 The confinement and ABI-refusal tests need control over the kernel, which a
@@ -700,9 +704,12 @@ Modes:
   or an interactive session without terminal-device access. These are plain-
   language recommendations, labeled advisory, so the hard pass-or-fail
   semantics stay undiluted.
-- Machine-readable output, a quiet form with one finding per line (file, line
-  number, kind, message), so a policy repository can gate commits. The
-  shipped policies are validated this way on every change.
+- Machine-readable output, a quiet form with one finding per line, so a
+  policy repository can gate commits: a refusal is the session's own line,
+  an advisory is one line marked as such, and the exit status carries the
+  judgment. Line numbers are not part of it, because the refusal messages
+  identify the directive, not the line. The shipped policies are validated
+  this way on every change.
 
 One mode from the proposal is deliberately left out. A computed preview of
 the `--narrow` intersection would have to model, in user space, how Landlock
