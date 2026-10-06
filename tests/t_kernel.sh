@@ -19,6 +19,7 @@ CHECK="$abs_top_builddir/src/dashlock-check"
 [ -x "$SHELLBIN" ] && [ -x "$CHECK" ] && [ -x ./t_asuser ] || { echo "Bail out! build the tree first"; exit 99; }
 "$CHECK" -V | grep -q 'backend landlock' || { echo "1..0 # SKIP landlock backend only"; exit 77; }
 ETC=$("$CHECK" -V | sed 's/.*policy directories \([^ ]*\) and .*/\1/')
+LIB=$("$CHECK" -V | sed 's/.*policy directories [^ ]* and \([^ ]*\)$/\1/')
 UID_T=${DASHLOCK_TEST_UID:-65534}
 GID_T=$(getent passwd "$UID_T" | cut -d: -f4)
 [ -n "$GID_T" ] || GID_T=$UID_T
@@ -97,5 +98,18 @@ check "abi-max below the kernel refuses with 78" 78 "exceeds policy abi-max 1" a
 printf 'access fs\nfrobnicate\n' > "$ETC/users/$KEY"
 check "unknown directive refuses with 78" 78 "unknown directive frobnicate" as_user "$D" -c 'echo must-not-run'
 rm -f "$ETC/users/$KEY"
-check "missing policy refuses with 78" 78 "no policy for user" as_user "$D" -c 'echo must-not-run'
+# Without a user file the lookup falls through to users/default in either
+# directory.  On a bare host that is a refusal; on a host with the vendor
+# or administrator default installed, the default is what must be found.
+if [ -e "$ETC/users/default" ] || [ -e "$LIB/users/default" ]; then
+	n=$((n + 1))
+	out=$(cd "$WORK" && as_user "$D" -c 'echo ran' 2>&1); rc=$?
+	if printf '%s' "$out" | grep -qF 'no policy for user'; then
+		echo "not ok $n - default policy is found when the user file is missing # $out"; failed=$((failed + 1))
+	else
+		echo "ok $n - default policy is found when the user file is missing (exit $rc)"
+	fi
+else
+	check "missing policy refuses with 78" 78 "no policy for user" as_user "$D" -c 'echo must-not-run'
+fi
 [ "$failed" = 0 ]
