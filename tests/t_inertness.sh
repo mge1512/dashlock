@@ -72,6 +72,18 @@ fi
 # --- corpus: the enabled build under three names versus upstream
 ENABLED="$abs_top_builddir/src/dash"
 [ -x "$ENABLED" ] || { say "Bail out! $ENABLED not built"; exit 99; }
+# A build without the name gate confines under every name by design, so
+# inertness under other names is not one of its properties; the corpus
+# is skipped for it and the byte-identity result above still counts.
+if ! grep -q '^#define DASHLOCK_NAME_GATE' "$abs_top_builddir/config.h" 2>/dev/null; then
+	for script in "$CORPUS"/*.sh; do
+		for name in sh ash dash; do
+			ok "corpus $(basename "$script" .sh) as $name # SKIP name gate disabled in this build"
+		done
+	done
+	[ "$failed" = 0 ]
+	exit $?
+fi
 mkdir -p "$WORK/names"
 for name in sh ash dash; do
 	ln -s "$ENABLED" "$WORK/names/$name"
