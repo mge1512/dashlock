@@ -330,11 +330,18 @@ Two entries are needed in practice and are easy to leave out:
   three levels down.
 
 A wildcard access category ("access fs") handles every right the build knows,
-which on a future kernel with a new right would leave that right unhandled. The
-masking prevents a wildcard from ever granting an unknown right, but it cannot
-make the wildcard restrict one, so a policy that uses a wildcard can set
-"abi-max" to the newest ABI it was reviewed against and refuse a newer kernel
-rather than under-restrict silently.
+and the ceiling of that expansion is the build itself: AbiKnown, a constant
+set at configure time, defaulting to the maximum of the access-right tables.
+A session's effective ABI is the smaller of the kernel's and AbiKnown. A
+kernel newer than the build changes nothing, because Landlock reads a ruleset
+attribute by the size the caller passes and treats a ruleset with an older
+layout exactly as that older ABI would; rights the build does not know stay
+unhandled, which is what the author reviewed. Earlier revisions put the
+ceiling into each policy file as "abi-max" and refused a newer kernel; that
+made every author restate a fact about the binary, and the first kernel
+reporting a newer ABI refused every session under the shipped default. A
+policy that must mean the same across builds with different tables lists its
+rights explicitly instead of using the wildcard.
 
 We do not link `dashlock` statically. Dynamic linking keeps library patching a
 distribution-level operation instead of a rebuild of every consumer, which is
@@ -422,7 +429,7 @@ enforcement is bound by three rules:
    only" is not expressible), and the `--narrow` layer. On the Landlock
    backend it covers the pledge directive.
 2. A precondition that does not apply to the backend is ignored. `abi-min`
-   and `abi-max` gate the Landlock version ladder; unveil has no ladder and
+   gates the Landlock version ladder; unveil has no ladder and
    nothing to gate. Ignoring them loses nothing, because every feature they
    would guard is covered by rule 1.
 3. Coarsening runs toward more denial, never less. The sixteen Landlock
@@ -451,7 +458,7 @@ with the class mapping, normative in the specification:
 | c | make-reg, make-dir, make-sock, make-fifo, make-char, make-block, make-sym, remove-file, remove-dir, refer |
 | (none) | ioctl-dev: not path-mediated by unveil; device ioctls fall under pledge promises |
 
-Everything outside the subset is backend-specific: `abi-min`, `abi-max`,
+Everything outside the subset is backend-specific: `abi-min`,
 `access fs:<subset>`, `access net-tcp`, `rule net-port` and `scope` belong to
 the Landlock backend; a `pledge` directive belongs to the unveil backend.
 
@@ -470,7 +477,7 @@ part that takes review effort, reads identically on both.
 | device ioctl | ioctl-dev per path | not path-mediated; pledge promise classes |
 | TCP | per-port bind and connect rules | not expressible; `inet` promise is all or nothing |
 | IPC scoping | abstract sockets and signals, ABI 6 | no equivalent; abstract socket namespace does not exist |
-| version gate | ABI ladder, abi-min and abi-max | none; the mechanism ships complete with the release |
+| version gate | ABI ladder: abi-min in the policy, the ceiling in the build | none; the mechanism ships complete with the release |
 | symbolic links in rule paths | refused via handle-based resolution, no race | refused at verification; final component re-resolved by name, one-syscall race remains |
 | inherited descriptors | not revoked | not revoked |
 | set-ID binaries in session | run without elevation (`no_new_privs`) | execution refused with `EACCES` |
@@ -501,7 +508,7 @@ what a Landlock denial produces, rather than a killed process.
 Version skew fails closed in both directions: an older kernel that does not
 know a name in the list rejects the whole `pledge` call and the session
 refuses; a newer kernel's new promise is absent from the list, so a child
-needing it is denied. The parallel to the wildcard-and-abi-max reasoning in
+needing it is denied. The parallel to the wildcard-and-ceiling reasoning in
 section 6.6 is deliberate.
 
 ### 7.6 Considered and rejected
@@ -524,6 +531,52 @@ section 6.6 is deliberate.
   Computable for directory prefixes, subtle for name-based entries, and
   exactly the kind of security-relevant complexity the kernel does for free
   on Linux. Deferred until something needs it.
+
+### 7.7 Prior art, and what is taken from it
+
+Three projects implement the same idea from the other side, OpenBSD's
+vocabulary realized on Linux, where dashlock realizes Linux's vocabulary on
+OpenBSD:
+
+- jart/pledge (ISC): the pledge and unveil code of Cosmopolitan libc as a
+  standalone port. Every pledge promise becomes a seccomp-BPF filter,
+  including the argument-level checks a promise implies, open flags for
+  `rpath` against `wpath`, socket families for `inet` against `unix`, the
+  ioctl set for `tty`; unveil becomes Landlock. The split between syscall
+  classes and paths is the one this design has.
+- marty1885/landlock-unveil, "llunveil" (WTFPL, with a 0BSD alternative):
+  an unveil-like function on Landlock, with the four classes r, w, x, c
+  mapped onto Landlock rights, the inverse of the PortableClass table in
+  section 7.3. Its stated limitation, that a file which does not exist
+  cannot be unveiled, is the object-versus-name divergence of section 7.4
+  seen from the other direction.
+- gnoack/landlockjail (Günther Noack, a Landlock maintainer), the program
+  llunveil was rewritten from, and the more authoritative reference for
+  Landlock API usage and ABI handling.
+
+What is taken from them is reading, not code. Two reasons, in order:
+
+1. Licensing policy. This tree takes code only under BSD-family or GPL-family
+   licenses. WTFPL does not pass that policy, and the jart port, permissive
+   as ISC is, is bound to Cosmopolitan's own libc and would come in as a
+   dependency rather than as a few reviewable functions, which the next
+   reason rules out on its own.
+2. The implementation stays one file with no new library. The reviewability
+   of `dashlock.c`, the inert build byte-identical to upstream, and the
+   upstream submission to dash all rest on that. Where an outside project
+   has worked out a mapping, the mapping is recorded as a table with its
+   provenance, the way the pledge promise names already are, and the code
+   that applies it is written here.
+
+The concrete consequence for the next step: syscall-class restriction on
+Linux will be the `pledge` directive enforced with seccomp-BPF, with the
+promise-to-syscall mapping derived from the jart tables as a reviewed
+snapshot, promises without a clean Linux mapping refused under rule 1, the
+architecture check first, and an error return rather than a kill by
+default. One directive, two backends. The alternative that was proposed, a
+deny-list profile copied from a container runtime, is rejected in section
+12; it would govern a general login session with a list tuned for a known
+workload and fail open on every syscall added later.
 
 ## 8. Assurance: testing and policy validation
 
@@ -633,7 +686,7 @@ The confinement and ABI-refusal tests need control over the kernel, which a
 hosted runner does not give. A virtual machine with a pinned kernel and
 controlled boot parameters is the deterministic option: the same image boots
 kernels on both sides of a policy's ABI to exercise the `abi-min` and
-`abi-max` refusal paths in both directions, and boots with Landlock disabled
+refusal path from both sides of the build ceiling, and boots with Landlock disabled
 to exercise the unavailable-kernel path. There is no hosted OpenBSD runner;
 the OpenBSD leg runs in a local virtual machine under the platform's own
 hypervisor, the same sandbox the backend was first tested in.
@@ -688,10 +741,8 @@ Modes:
   administrator can reproduce a refusal and get the session's report.
 - Kernel. Additionally query the running Landlock ABI and report whether the
   policy applies on this kernel: the derived required ABI, `abi-min`, any
-  ceiling, and the kernel value. Meaningful only on the deployment kernel or
-  a copy of it, which the output states. If the ABI ceiling moves from the
-  policy into the binary, this mode reports the binary's ceiling rather than
-  a policy line.
+  build's ceiling, the kernel value and the effective ABI. Meaningful only
+  on the deployment kernel or a copy of it, which the output states.
 - Dump. Print the normalized policy: handled rights per category, each path
   rule with its rights, net-port rules, scopes, the pledge set, and the
   derived required ABI. This is a canonical form, diffable between revisions
@@ -846,6 +897,16 @@ Limits specific to the unveil and pledge backend:
    objection.
 5. Does anything else we ship want the same treatment? The pattern generalizes
    to any process that reads untrusted instructions and then runs commands.
+6. Syscall-class restriction on Linux. The shape is decided (section 7.7:
+   the `pledge` directive enforced with seccomp-BPF, ERRNO rather than kill,
+   promises without a Linux mapping refused), the timing is after the ABI
+   ceiling move and as a specification delta of its own. A deny-list
+   profile copied from a container runtime was considered and rejected: an
+   allowlist of several hundred syscalls with argument rules is tuned for a
+   known workload, breaks rootless containers, debuggers and newer
+   programs in a general session, and a deny list fails open on every
+   syscall added after it was written. A promise vocabulary names what a
+   program needs, which is the question a policy author can answer.
 
 ## 13. References
 
@@ -856,6 +917,12 @@ Limits specific to the unveil and pledge backend:
   `sys/kern/vfs_syscalls.c`, `sys/kern/kern_pledge.c` in openbsd/src,
   reviewed 2026-09
 - `setpriv(1)`, util-linux 2.40 and later, for the access right vocabulary
+- jart/pledge: OpenBSD pledge and unveil on Linux with seccomp-BPF and
+  Landlock, ISC; https://github.com/jart/pledge
+- marty1885/landlock-unveil: an unveil-like function on Landlock, WTFPL
+  with a 0BSD alternative; https://github.com/marty1885/landlock-unveil
+- gnoack/landlockjail: the Landlock jail llunveil was rewritten from, by a
+  Landlock maintainer; https://github.com/gnoack/landlockjail
 - Trail of Bits, "VMs won't contain cyber-capable agents", 2026-08-26
 - dash upstream: Herbert Xu, current release 0.5.13.5
 - Vibe (Mistral AI), review of 2026-10-04: the proposal behind the test
