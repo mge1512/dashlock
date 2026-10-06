@@ -14,6 +14,7 @@ CHECK="$abs_top_builddir/src/dashlock-check"
 [ -x "$SHELLBIN" ] && [ -x "$CHECK" ] || { echo "Bail out! build the tree first"; exit 99; }
 "$CHECK" -V | grep -q 'backend unveil' || { echo "1..0 # SKIP unveil backend only"; exit 77; }
 ETC=$("$CHECK" -V | awk '{ for (i = 1; i <= NF; i++) if ($i == "directories") print $(i + 1) }')
+LIB=$("$CHECK" -V | awk '{ print $NF }')
 USER_T=${DASHLOCK_TEST_USER:-nobody}
 KEY=$(id -un "$USER_T" 2>/dev/null) || { echo "1..0 # SKIP no account $USER_T"; exit 77; }
 UID_T=$(id -u "$USER_T"); GID_T=$(id -g "$USER_T")
@@ -58,7 +59,7 @@ check() {	# check NAME WANT_EXIT WANT_SUBSTRING -- cmd...
 	fi
 }
 D="$WORK/dashlock"
-echo "1..8"
+echo "1..9"
 check "allowed read succeeds" 0 "localhost" "$D" -c 'cat /etc/hosts'
 check "a path outside the set reports ENOENT" 1 "No such file" "$D" -c "cat $WORK/secret"
 check "the same read succeeds as plain dash (name gate)" 0 "outside the set" "$WORK/dash" -c "cat $WORK/secret"
@@ -68,4 +69,16 @@ check "a set-ID binary is refused at exec (dash reports 126)" 126 "Permission de
 check "--narrow is refused with 78 before any policy is read" 78 "narrowing is not supported" "$D" --narrow x -c 'echo must-not-run'
 printf 'access fs\nscope signal\nrule path-beneath:read-file:/etc\n' > "$ETC/users/$KEY"
 check "scope refuses with 78 on this backend" 78 "backend cannot enforce scope" "$D" -c 'echo must-not-run'
+rm -f "$ETC/users/$KEY"
+if [ -e "$ETC/users/default" ] || [ -e "$LIB/users/default" ]; then
+	n=$((n + 1))
+	out=$(cd "$WORK" && as_user "$D" -c 'echo ran' 2>&1); rc=$?
+	if printf '%s' "$out" | grep -qF 'no policy for user'; then
+		echo "not ok $n - default policy is found when the user file is missing # $out"; failed=$((failed + 1))
+	else
+		echo "ok $n - default policy is found when the user file is missing (exit $rc)"
+	fi
+else
+	check "missing policy refuses with 78" 78 "no policy for user" as_user "$D" -c 'echo must-not-run'
+fi
 [ "$failed" = 0 ]
