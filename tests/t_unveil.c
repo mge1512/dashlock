@@ -103,10 +103,10 @@ static const struct scenario scenarios[] = {
 	  "pledge NULL | " },
 	{ "a symbolic-link leaf refuses before any unveil",
 	  "access fs\nrule path-beneath:read-file:/tmp/t_unveil_link\n",
-	  78, "cannot open rule path /tmp/t_unveil_link (errno 40)", "" },
+	  78, "cannot open rule path /tmp/t_unveil_link (errno ELOOP)", "" },
 	{ "a missing path refuses before any unveil",
 	  "access fs\nrule path-beneath:read-file:/no/such/dir\n",
-	  78, "cannot open rule path /no/such/dir (errno 2)", "" },
+	  78, "cannot open rule path /no/such/dir (errno ENOENT)", "" },
 	{ "every path is verified before the first unveil",
 	  "access fs\nrule path-beneath:read-file,read-dir:/etc\n"
 	  "rule path-beneath:read-file:/no/such/dir\n",
@@ -139,6 +139,32 @@ run_child(const struct scenario *s, int errfd, int lfd)
 	_exit(0);
 }
 
+/*
+ * Expected messages name errno constants symbolically, because the numbers
+ * differ between systems (ELOOP is 40 on Linux and 62 on OpenBSD).
+ */
+static const char *
+expect_msg(const char *tmpl, char *out, size_t len)
+{
+	const char *p = strstr(tmpl, "(errno ");
+	int val;
+
+	if (p == NULL) {
+		snprintf(out, len, "%s", tmpl);
+		return out;
+	}
+	if (strncmp(p + 7, "ELOOP)", 6) == 0)
+		val = ELOOP;
+	else if (strncmp(p + 7, "ENOENT)", 7) == 0)
+		val = ENOENT;
+	else {
+		snprintf(out, len, "%s", tmpl);
+		return out;
+	}
+	snprintf(out, len, "%.*s(errno %d)", (int)(p - tmpl), tmpl, val);
+	return out;
+}
+
 static void
 read_all(int fd, char *buf, size_t len)
 {
@@ -167,7 +193,7 @@ main(void)
 	for (i = 0; scenarios[i].name != NULL; i++) {
 		const struct scenario *s = &scenarios[i];
 		int ep[2], lp[2], status, code;
-		char err[1024], log[2048];
+		char err[1024], log[2048], msgbuf[256];
 		pid_t pid;
 
 		if (pipe(ep) != 0 || pipe(lp) != 0) {
@@ -195,9 +221,9 @@ main(void)
 			       i + 1, s->name, code, s->exit_code,
 			       err[0] ? err : "(no message)\n", log);
 			failed++;
-		} else if (s->message != NULL && strstr(err, s->message) == NULL) {
+		} else if (s->message != NULL && strstr(err, expect_msg(s->message, msgbuf, sizeof(msgbuf))) == NULL) {
 			printf("not ok %d - %s # message '%s' not in: %s",
-			       i + 1, s->name, s->message, err);
+			       i + 1, s->name, msgbuf, err);
 			failed++;
 		} else if (s->log[0] == '\0' ? log[0] != '\0' :
 		   strncmp(log, s->log, strlen(s->log)) != 0) {

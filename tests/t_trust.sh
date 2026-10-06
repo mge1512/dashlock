@@ -81,12 +81,12 @@ expect "group-writable directory in the chain" 78 \
 
 reset; valid "$E/users/real"; ln -s real "$E/users/agent"
 expect "symbolic link as the policy file" 78 \
-	"cannot open $E/users/agent (errno 40)" $CHECK agent
+	"cannot open $E/users/agent (errno " $CHECK agent
 
 reset; mkdir "$E/real"; chmod 0755 "$E/real"; valid "$E/real/agent"
 rm -rf "$E/users"; ln -s real "$E/users"
 expect "symbolic link as a directory component" 78 \
-	"cannot open policy path $E/users/agent (errno 20)" $CHECK agent
+	"cannot open policy path $E/users/agent (errno " $CHECK agent
 
 reset; mkfifo "$E/users/agent"; chmod 0644 "$E/users/agent"
 expect "FIFO in place of the policy" 78 \

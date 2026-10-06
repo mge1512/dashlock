@@ -119,7 +119,7 @@ $ sudo env DASHLOCK_TESTS_SYSTEM=1 make check   # adds the root-run layers
 cross-check table (one row per negative example in the specification), the
 Landlock enforcement sequence through recording seams, and the unveil
 sequence with stub calls. With `DASHLOCK_TESTS_SYSTEM=1` as root it also runs
-the policy-file trust fixtures under `/var/lib/dashlock-test` and, on a kernel
+the policy-file trust fixtures under `/var/dashlock-test` and, on a kernel
 with Landlock (or on OpenBSD), a confined session for one unprivileged test
 account under the real policy directory. The inertness test builds the fork
 with the feature disabled and compares it byte for byte with upstream dash

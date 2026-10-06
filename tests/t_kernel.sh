@@ -11,21 +11,22 @@
 
 [ "$(id -u)" = 0 ] && [ "${DASHLOCK_TESTS_SYSTEM:-0}" = 1 ] || {
 	echo "1..0 # SKIP needs root and DASHLOCK_TESTS_SYSTEM=1"; exit 77; }
-command -v setpriv >/dev/null 2>&1 || { echo "1..0 # SKIP setpriv not found"; exit 77; }
 [ "$(uname -s)" = Linux ] || { echo "1..0 # SKIP Linux only"; exit 77; }
 
 : "${abs_top_builddir:=$(cd "$(dirname "$0")/.." && pwd)}"
 SHELLBIN="$abs_top_builddir/src/dash"
 CHECK="$abs_top_builddir/src/dashlock-check"
-[ -x "$SHELLBIN" ] && [ -x "$CHECK" ] || { echo "Bail out! build the tree first"; exit 99; }
+[ -x "$SHELLBIN" ] && [ -x "$CHECK" ] && [ -x ./t_asuser ] || { echo "Bail out! build the tree first"; exit 99; }
 "$CHECK" -V | grep -q 'backend landlock' || { echo "1..0 # SKIP landlock backend only"; exit 77; }
 ETC=$("$CHECK" -V | sed 's/.*policy directories \([^ ]*\) and .*/\1/')
 UID_T=${DASHLOCK_TEST_UID:-65534}
+GID_T=$(getent passwd "$UID_T" | cut -d: -f4)
+[ -n "$GID_T" ] || GID_T=$UID_T
 KEY=$(getent passwd "$UID_T" | cut -d: -f1)
 [ -n "$KEY" ] || KEY=$UID_T
 [ -e "$ETC/users/$KEY" ] && { echo "Bail out! $ETC/users/$KEY exists; refusing to touch it"; exit 99; }
 
-WORK=$(mktemp -d /var/lib/dashlock-ktest.XXXXXX) || exit 99
+WORK=$(mktemp -d /var/dashlock-ktest.XXXXXX) || exit 99
 chmod 0755 "$WORK"
 cleanup() { rm -f "$ETC/users/$KEY" "$ETC/narrow/t-ro"; rm -rf "$WORK"; }
 trap cleanup EXIT
@@ -64,7 +65,8 @@ if ! "$CHECK" -k "$KEY" >/dev/null 2>"$WORK/k.err"; then
 	echo "Bail out! $(cat "$WORK/k.err")"; exit 99
 fi
 
-as_user() { setpriv --reuid "$UID_T" --regid "$UID_T" --clear-groups "$@"; }
+ASUSER="$(pwd)/t_asuser"
+as_user() { "$ASUSER" "$UID_T" "$GID_T" "$@"; }
 n=0; failed=0
 check() {	# check NAME WANT_EXIT WANT_SUBSTRING -- cmd...
 	name=$1; want=$2; sub=$3; shift 3

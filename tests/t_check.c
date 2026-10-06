@@ -6,7 +6,7 @@
  * script reads the directories back from "t_check -V".
  */
 #ifndef DASHLOCK_TEST_FIXTURE_ROOT
-#define DASHLOCK_TEST_FIXTURE_ROOT "/var/lib/dashlock-test"
+#define DASHLOCK_TEST_FIXTURE_ROOT "/var/dashlock-test"
 #endif
 #undef DASHLOCK_ETCDIR
 #undef DASHLOCK_LIBDIR

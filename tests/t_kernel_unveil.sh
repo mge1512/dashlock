@@ -16,6 +16,9 @@ CHECK="$abs_top_builddir/src/dashlock-check"
 ETC=$("$CHECK" -V | awk '{ for (i = 1; i <= NF; i++) if ($i == "directories") print $(i + 1) }')
 USER_T=${DASHLOCK_TEST_USER:-nobody}
 KEY=$(id -un "$USER_T" 2>/dev/null) || { echo "1..0 # SKIP no account $USER_T"; exit 77; }
+UID_T=$(id -u "$USER_T"); GID_T=$(id -g "$USER_T")
+[ -x ./t_asuser ] || { echo "Bail out! build the tree first"; exit 99; }
+ASUSER="$(pwd)/t_asuser"
 [ -e "$ETC/users/$KEY" ] && { echo "Bail out! $ETC/users/$KEY exists; refusing to touch it"; exit 99; }
 
 WORK=$(mktemp -d /var/dashlock-ktest.XXXXXX) || exit 99
@@ -37,12 +40,12 @@ rule path-beneath:read-file,write-file,read-dir,make-reg,remove-file,truncate:$W
 END
 chmod 0644 "$ETC/users/$KEY"
 
-as_user() { su -s /bin/sh "$USER_T" -c "$*"; }
+as_user() { "$ASUSER" "$UID_T" "$GID_T" "$@"; }
 n=0; failed=0
-check() {	# check NAME WANT_EXIT WANT_SUBSTRING command-string
-	name=$1; want=$2; sub=$3; cmd=$4
+check() {	# check NAME WANT_EXIT WANT_SUBSTRING -- cmd...
+	name=$1; want=$2; sub=$3; shift 3
 	n=$((n + 1))
-	out=$(cd "$WORK" && as_user "$cmd" 2>&1); rc=$?
+	out=$(cd "$WORK" && as_user "$@" 2>&1); rc=$?
 	if [ "$rc" != "$want" ]; then
 		echo "not ok $n - $name # exit $rc, expected $want: $out"; failed=$((failed + 1))
 	elif [ -n "$sub" ] && ! printf '%s' "$out" | grep -qF -- "$sub"; then
@@ -53,13 +56,13 @@ check() {	# check NAME WANT_EXIT WANT_SUBSTRING command-string
 }
 D="$WORK/dashlock"
 echo "1..8"
-check "allowed read succeeds" 0 "localhost" "$D -c 'cat /etc/hosts'"
-check "a path outside the set reports ENOENT" 1 "No such file" "$D -c 'cat $WORK/secret'"
-check "the same read succeeds as plain dash (name gate)" 0 "outside the set" "$SHELLBIN -c 'cat $WORK/secret'"
-check "the set survives execve into another interpreter" 1 "No such file" "$D -c '/bin/sh -c \"cat $WORK/secret\"'"
-check "write inside the set works" 0 "" "$D -c 'echo x > $WORK/box/f && rm $WORK/box/f'"
-check "a set-ID binary is refused at exec" 1 "Permission denied" "$D -c 'ping -c1 127.0.0.1'"
-check "--narrow is refused with 78 before any policy is read" 78 "narrowing is not supported" "$D --narrow x -c 'echo must-not-run'"
+check "allowed read succeeds" 0 "localhost" "$D" -c 'cat /etc/hosts'
+check "a path outside the set reports ENOENT" 1 "No such file" "$D" -c "cat $WORK/secret"
+check "the same read succeeds as plain dash (name gate)" 0 "outside the set" "$SHELLBIN" -c "cat $WORK/secret"
+check "the set survives execve into another interpreter" 1 "No such file" "$D" -c "/bin/sh -c 'cat $WORK/secret'"
+check "write inside the set works" 0 "" "$D" -c "echo x > $WORK/box/f && rm $WORK/box/f"
+check "a set-ID binary is refused at exec (dash reports 126)" 126 "Permission denied" "$D" -c 'ping -c1 127.0.0.1'
+check "--narrow is refused with 78 before any policy is read" 78 "narrowing is not supported" "$D" --narrow x -c 'echo must-not-run'
 printf 'access fs\nscope signal\nrule path-beneath:read-file:/etc\n' > "$ETC/users/$KEY"
-check "scope refuses with 78 on this backend" 78 "backend cannot enforce scope" "$D -c 'echo must-not-run'"
+check "scope refuses with 78 on this backend" 78 "backend cannot enforce scope" "$D" -c 'echo must-not-run'
 [ "$failed" = 0 ]
