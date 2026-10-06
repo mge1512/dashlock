@@ -10,7 +10,7 @@ DASHLOCK_WARN_CFLAGS =
 AM_CFLAGS = $(DASHLOCK_WARN_CFLAGS)
 
 # Where the trust fixtures are built; the root chain must be root-owned.
-FIXTURE_ROOT = /var/lib/dashlock-test
+FIXTURE_ROOT = /var/dashlock-test
 
 AM_TESTS_ENVIRONMENT = \
 	abs_top_srcdir='$(abs_top_srcdir)'; export abs_top_srcdir; \
@@ -28,7 +28,7 @@ if BUILD_DASHLOCK
 # Layer 1 and the contract (both backends), Layer 5 (unveil, stubbed),
 # Layer 3 helpers.  Layer 2 is Landlock-specific and is not built on an
 # unveil host, where the Landlock headers are absent.
-check_PROGRAMS = t_parse t_unveil t_check t_trustseam
+check_PROGRAMS = t_parse t_unveil t_check t_trustseam t_asuser
 if !BUILD_DASHLOCK_UNVEIL
 check_PROGRAMS += t_sequence
 SEQUENCE_TESTS = t_sequence

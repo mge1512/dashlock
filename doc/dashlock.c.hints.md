@@ -474,7 +474,7 @@ flags and a fixed `SOURCE_DATE_EPOCH`, taking upstream from `UPSTREAM_SRC`
 or from the "Release 0.5.13.5" commit in the fork's history; it passes only
 because `src/Makefile.am` links `dashlock.o` solely when the feature is
 built. The root-run layers (`t_trust.sh`, `t_kernel.sh`,
-`t_kernel_unveil.sh`) write under `/var/lib/dashlock-test` and the real
+`t_kernel_unveil.sh`) write under `/var/dashlock-test` and the real
 policy directory for one test account, so they run only under
 `DASHLOCK_TESTS_SYSTEM=1` and report SKIP otherwise; `.github/workflows/ci.yml`
 sets it for the root job.
