@@ -86,7 +86,10 @@ The version ladder, with the kernel that introduced each level:
 ABI 6 is the first level at which the design closes, because scoping is what
 stops a confined process from reaching an unconfined broker over an abstract
 socket and having it run code outside the domain. SLE 16 ships a 6.12 kernel,
-so ABI 6 is what we target. On a 6.4 kernel, which is what SLE 15 SP7 ships,
+so ABI 6 is what we target. Of the later versions, ABI 9 (kernel 7.1)
+matters to this design: `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` restricts connects
+to pathname UNIX sockets, which closes the service-manager escape described
+in section 11 inside the policy instead of by deployment. On a 6.4 kernel, which is what SLE 15 SP7 ships,
 only ABI 3 is available and the broker path cannot be closed. We do not support
 that configuration.
 
@@ -829,6 +832,31 @@ than a missing feature.
   CPU mitigations enabled, and a kernel that tracks upstream stable.
 - The shell hook covers the shell. `internal-sftp`, `systemd --user`, cron, and
   at reach the account without passing through it.
+- The reverse direction is open as well, and it is a class, not one binary:
+  a session can ask an unconfined service of the same account to act on its
+  behalf. On Linux the per-user service manager is such a service: a message
+  over the session bus (`systemd-run --user`, `busctl --user call ...
+  StartTransientUnit`, any D-Bus client) makes `systemd --user` fork the
+  requested command from itself, outside the Landlock domain, because the
+  new process was never a descendant of the session. The result is the
+  account's full, unconfined authority, which is the whole promise broken,
+  since here the account is the untrusted party. The same escape was found
+  in nono (GHSA-27vp-2mmc-vmh3, CVE-2026-47128). Landlock closes the
+  abstract-address route with `scope abstract-unix-socket`, which the
+  shipped policies set; it does not mediate connects to pathname sockets
+  before ABI 9, where `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` restricts `connect`
+  and `sendmsg` to pathname UNIX sockets created outside the domain, with
+  the semantics of the scope flags, and the session bus is such a socket.
+  Kernel 7.1 carries ABI 9; SLES 16 at ABI 6 does not. Until the floor
+  reaches it, the measure is a deployment precondition: the confined
+  account gets no user service manager (`user@<uid>.service` masked, no
+  lingering), so there is no session bus to reach; this closes the known
+  reproducer completely, not partially. A seccomp filter refusing
+  `socket(AF_UNIX)` would close the whole class today but also stops name
+  lookups through sssd and nscd, syslog over `/dev/log`, ssh-agent and
+  every other local socket, so it is an opt-in for accounts that can
+  tolerate it, not a default for a shell. Once the floor allows it,
+  RESOLVE_UNIX becomes one rule in the policy, like a net-port rule.
 - Confinement begins in `main()`. The dynamic loader and any constructors it
   runs execute first, so a launcher that passes a user-controlled environment
   hands the account `LD_PRELOAD` before the policy exists. The standard login

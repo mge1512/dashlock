@@ -206,7 +206,8 @@ inaccessible.
 
 ## Security model
 
-The confinement is real and cannot be escaped from inside once applied. What it
+The confinement is real and cannot be escaped from inside once applied, as long
+as the conditions below hold. What it
 depends on is the launch, and those conditions cannot be established by a shell
 from within itself. They are preconditions, not caveats:
 
@@ -234,6 +235,14 @@ Also true of the design, and relevant before deploying:
 - Confinement applies to the shell. Paths that reach an account without starting
   one, such as the SFTP subsystem, the per-user service manager, and cron, must
   be closed separately.
+- The per-user service manager is also an escape from inside: a confined
+  session can ask `systemd --user` over the session bus to start a command,
+  and the command runs outside the domain with the account's full authority
+  (the escape reported against nono as GHSA-27vp-2mmc-vmh3). A policy cannot
+  refuse that connection below Landlock ABI 9 (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`,
+  kernel 7.1); until then a confined account must have no user manager:
+  mask `user@<uid>.service` and disable lingering. The abstract-socket route
+  is closed by `scope abstract-unix-socket`, which the shipped policies set.
 - Landlock has no hooks for `mount`, `chdir`, or metadata operations such as
   `chmod` and `chown`, and on the network side covers TCP only. UDP, ICMP, and
   raw sockets are outside its scope.
