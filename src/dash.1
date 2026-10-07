@@ -2805,6 +2805,26 @@ which removes the dependency on
 entirely: that build applies a policy whatever it is invoked as, and refuses to
 run without one.
 .Pp
+A confined session can still ask an unconfined service of the same account
+to act for it.
+On Linux the per-user service manager is such a service: a request over the
+session bus, for example
+.Ql systemd-run --user ,
+makes
+.Xr systemd 1
+fork the command from itself, outside the domain, with the account's full
+authority.
+The policy cannot refuse the connection on a kernel below Landlock ABI 9,
+where
+.Dv LANDLOCK_ACCESS_FS_RESOLVE_UNIX
+restricts connections to pathname UNIX sockets; the abstract-socket route is
+closed by
+.Ic scope abstract-unix-socket .
+Until then, give a confined account no user service manager: mask
+.Ql user@<uid>.service
+and disable lingering for it, so that no session bus exists to reach.
+The same escape was reported against nono as GHSA-27vp-2mmc-vmh3.
+.Pp
 An account whose name contains bytes outside the printable ASCII range, or a
 .Ql / ,
 or whose name does not fit in 255 bytes, is keyed by its decimal user ID

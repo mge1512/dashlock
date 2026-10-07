@@ -410,6 +410,13 @@ genuine-race run stays a manual check.
 
 ## The policy checker: dashlock-check
 
+Lint to add for the service-manager escape (design, section 11): warn when
+the account named on the command line has a reachable user service manager,
+that is `/etc/systemd/system/user@<uid>.service` is not a symlink to
+`/dev/null` or `/var/lib/systemd/linger/<name>` exists. Advisory, Linux
+only, never in the exit code; the fix is deployment, not policy, until the
+kernel floor reaches ABI 9 and `RESOLVE_UNIX` becomes a rule.
+
 `dashlock-check.c` includes `dashlock.c` the way the unit drivers do and
 provides its own `main`, so it links the shell's own `dl_user_key`,
 `dl_load` (lookup, trust checks, and `dl_parse`), `dl_required_abi`, and

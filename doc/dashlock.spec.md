@@ -1022,6 +1022,14 @@ Launch conditions, all the responsibility of whatever invokes the shell:
 - Access paths that do not start a shell are closed separately: the SFTP
   subsystem, the per-user service manager, and scheduled job runners each
   reach the account without passing through this code.
+- No service of the confined account that spawns processes on request is
+  reachable from the session. On Linux the per-user service manager is such
+  a service: a message over the session bus makes it start a process outside
+  the domain. A policy cannot refuse that connection below Landlock ABI 9,
+  whose LANDLOCK_ACCESS_FS_RESOLVE_UNIX restricts connects to pathname UNIX
+  sockets created outside the domain; the abstract-socket route is closed by
+  scoping. Until the kernel floor reaches ABI 9, the deployment masks the
+  account's user manager and disables lingering (design, section 11).
 
 Environment conditions:
 
@@ -1614,7 +1622,11 @@ that had not changed. A policy that must mean the same across builds with
 different tables lists its rights explicitly instead of using the wildcard.
 The required-ABI refusal now names which bound was hit, the kernel or the
 build; the checker's kernel mode reports both bounds and the effective ABI;
-the shipped policies carry no ceiling.
+the shipped policies carry no ceiling. This revision also records, as a
+launch condition, that a reachable unconfined service of the account (the
+per-user service manager over D-Bus) is an escape until Landlock ABI 9 lets
+a policy restrict pathname UNIX connects; nothing in the behaviors changes.
+
 
 Version 0.7.0 adds assurance; the confinement behavior is unchanged. It
 introduces validate-policy,
