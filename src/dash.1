@@ -2710,6 +2710,14 @@ a rule on
 .Pa /usr
 covers the loader, because Landlock resolves the symbolic link and matches on
 the inode.
+Without a merged
+.Pa /usr ,
+.Pa /bin , /sbin , /lib
+and
+.Pa /lib64
+are real directories and need rules of their own.
+The vendor policies carry these rules commented out, and packages for such
+systems activate them at build time.
 .Pp
 Landlock has no hooks for
 .Xr mount 2 ,

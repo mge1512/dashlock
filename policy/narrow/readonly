@@ -25,7 +25,14 @@ abi-max 6
 
 access fs
 
+# Programs, libraries and the dynamic loader.  Without a merged /usr the
+# package build uncomments the four rules below, as in users/default:
+# layers intersect, so this layer needs them as well.
 rule path-beneath:execute,read-file,read-dir:/usr
+#rule path-beneath:execute,read-file,read-dir:/bin
+#rule path-beneath:execute,read-file,read-dir:/sbin
+#rule path-beneath:execute,read-file,read-dir:/lib
+#rule path-beneath:execute,read-file,read-dir:/lib64
 rule path-beneath:read-file,read-dir:/etc
 rule path-beneath:read-file,read-dir:/proc
 rule path-beneath:read-file,write-file,ioctl-dev:/dev/tty
