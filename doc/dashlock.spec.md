@@ -20,7 +20,7 @@ This specification is written in PCD form but is not intended to be executed as
 a full PCD translation. It is language-agnostic; the platform realizations,
 C on Linux and C on OpenBSD, including system-call numbers, structure layouts,
 header handling, and the build options, are in the accompanying hints file
-`dashlock.c.hints.md`. The existing implementation is dash 0.5.13.5 by Herbert
+`dashlock.c.hints.md`. The existing implementation is dash 0.5.13.6 by Herbert
 Xu, a long-established C codebase that is not going to be regenerated from a
 specification. What the PCD form buys here is the discipline: every rule that
 decides whether a session is confined is written down once, in a place where it
@@ -1033,7 +1033,7 @@ Launch conditions, all the responsibility of whatever invokes the shell:
 
 Environment conditions:
 
-- The existing dash 0.5.13.5 source tree is present and builds.
+- The existing dash 0.5.13.6 source tree is present and builds.
 - On the landlock backend: the kernel provides Landlock at ABI version 6 or
   higher, which means 6.12 or later, and landlock appears in CONFIG_LSM or in
   the lsm= boot parameter.
@@ -1575,7 +1575,7 @@ COMPONENT: continuous-integration
   the shell's only pre-shell argument handling stays consume-narrow-argument.
 - Behavior change when the binary is invoked under a name other than the
   trigger name: forbidden. This is a testable property: a `--disable-dashlock`
-  build is expected to be identical to upstream dash 0.5.13.5 built from the
+  build is expected to be identical to upstream dash 0.5.13.6 built from the
   same release tarball with the same flags and a fixed source-date epoch, and
   with the gate enabled the only differences among the sources compiled
   into the shell are the two lines in src/main.c and the added translation

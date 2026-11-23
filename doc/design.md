@@ -661,14 +661,14 @@ work verified the sequence before the OpenBSD sandbox existed.
 The promise that the binary is byte-for-byte upstream dash under any other
 name is a security claim, and it can be checked mechanically rather than
 argued. A `--disable-dashlock` build should be identical to upstream dash
-0.5.13.5 built from the same release tarball with the same flags and a fixed
+0.5.13.6 built from the same release tarball with the same flags and a fixed
 `SOURCE_DATE_EPOCH`; with the gate enabled, the only differences among the
 sources compiled into the shell are the two lines in `main.c` and the added
 `dashlock` translation unit. The
 behavioral corpus that backs this up stays small on purpose: it needs to
 cover the option-parsing paths around the `--narrow` consumption, the only
 point where the fork touches argv before the shell starts. The baseline is
-upstream 0.5.13.5, not dash master, because comparing against master would
+upstream 0.5.13.6, not dash master, because comparing against master would
 measure upstream's drift since the fork point rather than anything about the
 fork. Making the comparison pass took one change: a disabled build still
 linked an empty `dashlock.o`, visible as one file symbol in the symbol
@@ -952,6 +952,6 @@ Limits specific to the unveil and pledge backend:
 - gnoack/landlockjail: the Landlock jail llunveil was rewritten from, by a
   Landlock maintainer; https://github.com/gnoack/landlockjail
 - Trail of Bits, "VMs won't contain cyber-capable agents", 2026-08-26
-- dash upstream: Herbert Xu, current release 0.5.13.5
+- dash upstream: Herbert Xu, current release 0.5.13.6
 - Vibe (Mistral AI), review of 2026-10-04: the proposal behind the test
   infrastructure of section 8 and the policy validation tool of section 9

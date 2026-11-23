@@ -33,7 +33,7 @@ the dash maintainers.
 | --- | --- |
 | Upstream | `https://git.kernel.org/pub/scm/utils/dash/dash.git` |
 | Upstream maintainer | Herbert Xu |
-| Forked at | `037bbdf`, release 0.5.13.5 |
+| Forked at | `0a896bf`, release 0.5.13.6 |
 
 Report bugs in the shell itself upstream. Report anything in `src/dashlock.c`,
 `src/dashlock.h`, the policy format, or the `DASHLOCK` manual section here.
@@ -123,7 +123,7 @@ the policy-file trust fixtures under `/var/dashlock-test` and, on a kernel
 with Landlock (or on OpenBSD), a confined session for one unprivileged test
 account under the real policy directory. The inertness test builds the fork
 with the feature disabled and compares it byte for byte with upstream dash
-0.5.13.5 from the repository history. `.github/workflows/ci.yml` runs all of
+0.5.13.6 from the repository history. `.github/workflows/ci.yml` runs all of
 it, plus a build with the Landlock header hidden that must fail, a sanitizer
 build, and a bounded fuzzing run of the parser.
 

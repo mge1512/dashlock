@@ -17,7 +17,7 @@ Where a hint and the spec disagree, the spec wins and the hint is wrong.
 
 ## Target and integration
 
-- Base: dash 0.5.13.5 (Herbert Xu). The addition is two new files, `src/dashlock.c`
+- Base: dash 0.5.13.6 (Herbert Xu). The addition is two new files, `src/dashlock.c`
   and `src/dashlock.h`, plus a two-line hook in `src/main.c` and build glue in
   `configure.ac` and `src/Makefile.am`.
 - Platform floor: Linux 6.12 (Landlock ABI 6), or OpenBSD 7.9 (unveil and
@@ -484,9 +484,9 @@ upstream dash does not build under `-Wextra` and its flags stay upstream's
 confinement code is covered); one build of the kernel-free layers under the
 undefined-behavior and address sanitizers. The inertness check
 (`tests/t_inertness.sh`) compares a `--disable-dashlock` build byte-for-byte
-against upstream dash 0.5.13.5 built from the same source with the same
+against upstream dash 0.5.13.6 built from the same source with the same
 flags and a fixed `SOURCE_DATE_EPOCH`, taking upstream from `UPSTREAM_SRC`
-or from the "Release 0.5.13.5" commit in the fork's history; it passes only
+or from the "Release 0.5.13.6" commit in the fork's history; it passes only
 because `src/Makefile.am` links `dashlock.o` solely when the feature is
 built. The root-run layers (`t_trust.sh`, `t_kernel.sh`,
 `t_kernel_unveil.sh`) write under `/var/dashlock-test` and the real

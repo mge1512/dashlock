@@ -4,14 +4,14 @@
 # byte for byte.
 #
 # 1. Byte identity: build the fork with --disable-dashlock and pristine
-#    upstream 0.5.13.5 from the same autotools setup, the same flags and a
+#    upstream 0.5.13.6 from the same autotools setup, the same flags and a
 #    fixed SOURCE_DATE_EPOCH, and compare the two binaries with cmp.
 # 2. Corpus: run every script in tests/corpus with the enabled build under
 #    the names sh, ash and dash, and with the upstream build, and compare
 #    stdout, stderr and exit status.
 #
-# The upstream source comes from UPSTREAM_SRC (a pristine 0.5.13.5 tree),
-# or from the git history of the fork ("Release 0.5.13.5"); without either
+# The upstream source comes from UPSTREAM_SRC (a pristine 0.5.13.6 tree),
+# or from the git history of the fork ("Release 0.5.13.6"); without either
 # the test reports SKIP.
 
 : "${abs_top_srcdir:=$(cd "$(dirname "$0")/.." && pwd)}"
@@ -32,14 +32,14 @@ mkdir -p "$WORK/upstream" "$WORK/fork"
 if [ -n "$UPSTREAM_SRC" ]; then
 	cp -R "$UPSTREAM_SRC/." "$WORK/upstream/"
 elif git -C "$abs_top_srcdir" rev-parse --git-dir >/dev/null 2>&1; then
-	rev=$(git -C "$abs_top_srcdir" log --format=%H -1 --grep='^Release 0.5.13.5')
+	rev=$(git -C "$abs_top_srcdir" log --format=%H -1 --grep='^Release 0.5.13.6')
 	if [ -z "$rev" ]; then
 		say "1..0 # SKIP no upstream release commit in history"
 		exit 77
 	fi
 	git -C "$abs_top_srcdir" archive "$rev" | tar -x -C "$WORK/upstream"
 else
-	say "1..0 # SKIP set UPSTREAM_SRC to a pristine dash 0.5.13.5 tree"
+	say "1..0 # SKIP set UPSTREAM_SRC to a pristine dash 0.5.13.6 tree"
 	exit 77
 fi
 command -v autoreconf >/dev/null 2>&1 || { say "1..0 # SKIP autoreconf not found"; exit 77; }
@@ -64,9 +64,9 @@ if ! build "$WORK/fork"; then
 	say "Bail out! fork build failed, see $WORK/fork.log"; exit 99
 fi
 if cmp -s "$WORK/upstream/src/dash" "$WORK/fork/src/dash"; then
-	ok "--disable-dashlock build is byte-identical to upstream 0.5.13.5"
+	ok "--disable-dashlock build is byte-identical to upstream 0.5.13.6"
 else
-	notok "--disable-dashlock build differs from upstream 0.5.13.5"
+	notok "--disable-dashlock build differs from upstream 0.5.13.6"
 fi
 
 # --- corpus: the enabled build under three names versus upstream
